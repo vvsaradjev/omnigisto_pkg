@@ -1,7 +1,10 @@
 name: omnigisto_pkg
 description: "A lightweight, fast, and memory-efficient Flutter/Dart library for reading Aperio SVS image metadata, extracting tiles, and associated images."
 version: 0.0.1-alfa.1
-homepage:
+homepage: https://github.com/vvsaradjev/omnigisto_pkg
+repository: https://github.com/vvsaradjev/omnigisto_pkg
+issue_tracker: https://github.com/vvsaradjev/omnigisto_pkg/issues
+
 
 environment:
   sdk: ^3.11.5
