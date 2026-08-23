@@ -8,8 +8,8 @@ A lightweight, fast, and memory-efficient Dart & Flutter library for reading Ape
 
 - **Memory-Efficient & Fast**: Uses `RandomAccessFile` and `ByteData` to stream and read TIFF/SVS headers and tile offsets positionally without loading the entire multi-gigabyte image into memory.
 - **Full Pyramid Inspection**: Retrieve dimensions, tile configurations, compression formats, and resolution levels for the whole slide pyramid.
-- **On-Demand Tile Extraction**: Extract specific image tiles by level and tile grid coordinates (`tileX`, `tileY`) as raw compressed image bytes (`Uint8List`).
-- **Associated Images**: Extract non-tiled associated images such as `thumbnail`, `label` (slide barcode/label), and `macro` (full slide preview).
+- **On-Demand Tile Extraction**: Extract specific image tiles by level and tile grid coordinates (`tileX`, `tileY`) in different formats.
+- **Associated Images**: Extract non-tiled associated images such as `thumbnail`, `label` (slide barcode/label), and `macro` (full slide preview) in different formats.
 - **Aperio Metadata Parser**: Automatically parses Aperio header properties, compression quality (`Q`), microns-per-pixel (`MPPS`), scan dimensions, and custom key-value pairs.
 - **Cross-Platform**: Works across all platforms supported by Dart `dart:io` (Flutter for Android, iOS, macOS, Windows, Linux).
 
@@ -39,7 +39,6 @@ dart pub get
 
 ```dart
 import 'package:omnigisto_pkg/metadata_read.dart';
-import 'package:omnigisto_pkg/types/types.dart';
 ```
 
 ---
@@ -111,8 +110,28 @@ if (fullMeta != null) {
 
 ### 4. Extracting Associated Images (Thumbnail, Label, Macro)
 
-Extract raw bytes for preview images and display them directly in Flutter:
+Extract img.Image to display  them directly in Flutter UI:
 
+```dart
+import 'dart:typed_data';
+import 'package:flutter/material.dart';
+import 'package:image/image.dart' as img;
+
+// Extract thumbnail, label, or macro
+final img.Image? thumb = await extractSvsImageAsImage(svs, 'thumbnail');
+final img.Image? label = await extractSvsImageAsImage(svs, 'label');
+final img.Image? macro = await extractSvsImageAsImage(svs, 'macro');
+
+// Example Flutter Widget rendering
+Widget buildImage(img.Image? pic) {
+  if (pic == null) return const Text('Image not available');
+  
+  final Uint8List? tmp = Uint8List.fromList(img.encodeJpg(pic));
+  return Image.memory(tmp);
+}
+```
+
+Extract raw bytes for associated images as in svs file, it's fast, but can't be used directly in flutter UI
 ```dart
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
@@ -122,20 +141,45 @@ final Uint8List? thumbBytes = await extractSvsImage(svs, 'thumbnail');
 final Uint8List? labelBytes = await extractSvsImage(svs, 'label');
 final Uint8List? macroBytes = await extractSvsImage(svs, 'macro');
 
-// Example Flutter Widget rendering
-Widget buildImage(Uint8List? bytes) {
-  if (bytes == null) return const Text('Image not available');
-  return Image.memory(bytes);
-}
 ```
+
+
 
 ---
 
 ### 5. Extracting Individual Tiles
 
-Extract specific tiles on demand for viewport rendering or deep-zoom viewers:
+Extract specific tiles on demand to display  them directly in Flutter UI for viewport rendering or deep-zoom viewers
 
 ```dart
+import 'dart:typed_data';
+import 'package:flutter/material.dart';
+import 'package:image/image.dart' as img;
+final fullMeta = await readFullSvsMetadata(svs);
+if (fullMeta != null && fullMeta.levels.isNotEmpty) {
+    const int levelIndex = 0; // 0 = highest resolution baseline
+    final level = fullMeta.levels[levelIndex];
+    
+    int totalCols = (level.width + level.tileWidth! - 1) ~/ level.tileWidth!;
+    int totalRows = (level.height + level.tileHeight! - 1) ~/ level.tileHeight!;
+    
+    print('Grid size: $totalCols columns x $totalRows rows');
+    
+    // Extract tile at coordinate (tileX: 0, tileY: 0)
+    final img.Image? tile = await extractSvsTileAsImage(svs, levelIndex, 0, 0);
+    
+    Uint8List? tileBytes =  Uint8List.fromList(img.encodeJpg(tile));
+  
+}
+
+
+```
+
+Extract specific tiles as is:
+```dart
+import 'dart:typed_data';
+import 'package:flutter/material.dart';
+
 final fullMeta = await readFullSvsMetadata(svs);
 if (fullMeta != null && fullMeta.levels.isNotEmpty) {
   const int levelIndex = 0; // 0 = highest resolution baseline
@@ -154,7 +198,12 @@ if (fullMeta != null && fullMeta.levels.isNotEmpty) {
     }
   }
 }
+
+
 ```
+
+
+
 
 ---
 
@@ -162,13 +211,18 @@ if (fullMeta != null && fullMeta.levels.isNotEmpty) {
 
 ### Functions
 
-| Function | Description |
-| :--- | :--- |
-| `Future<SvsFile?> openSvsFile(String path)` | Opens an SVS file and parses the TIFF header. |
-| `Future<SvsMetadata?> readSvsMetadata(SvsFile svs)` | Reads basic metadata of the primary image. |
-| `Future<SvsFullMetadata?> readFullSvsMetadata(SvsFile svs)` | Reads all pyramid levels and associated image metadata. |
-| `Future<Uint8List?> extractSvsImage(SvsFile svs, String type)` | Extracts raw bytes for `'thumbnail'`, `'label'`, or `'macro'`. |
-| `Future<Uint8List?> extractSvsTile(SvsFile svs, int layerIndex, int tileX, int tileY)` | Extracts raw bytes for a specific tile at the given grid coordinates. |
+| Function                                                                                                                                   | Description                                                           |
+|:-------------------------------------------------------------------------------------------------------------------------------------------|:----------------------------------------------------------------------|
+| `Future<SvsFile?> openSvsFile(String path)`                                                                                                | Opens an SVS file and parses the TIFF header.                         |
+| `Future<SvsMetadata?> readSvsMetadata(SvsFile svs)`                                                                                        | Reads basic metadata of the primary image.                            |
+| `Future<SvsFullMetadata?> readFullSvsMetadata(SvsFile svs)`                                                                                | Reads all pyramid levels and associated image metadata.               |
+| `Future<img.Image?> extractSvsImageAsImage(SvsFile svs, String type)`                                                                      | Extracts Image for `'thumbnail'`, `'label'`, or `'macro'`.            |
+| `Future<Uint8List?> extractSvsImageAsJpeg(SvsFile svs, String type, { int quality = 90 })`                                                 | Extracts JPEG raw bytes for `'thumbnail'`, `'label'`, or `'macro'`    |
+| `Future<Uint8List?> extractSvsImage(SvsFile svs, String type)`                                                                             | Extracts raw bytes for `'thumbnail'`, `'label'`, or `'macro'`.        |
+| `Future<Uint8List?> extractSvsImage(SvsFile svs, String type)`                                                                             | Extracts raw bytes for `'thumbnail'`, `'label'`, or `'macro'`.        |
+| `Future<img.Image?> extractSvsTileAsImage(SvsFile svs, int layerIndex, int tileX,int tileY`                                                | Extracts Image for a specific tile at the given grid coordinates.     |
+| `Future<Uint8List?> extractSvsTile(SvsFile svs, int layerIndex, int tileX, int tileY)`                                                     | Extracts raw bytes for a specific tile at the given grid coordinates. |
+
 
 ### Classes
 

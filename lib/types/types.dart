@@ -1,3 +1,6 @@
+import 'dart:io';
+import 'dart:typed_data';
+
 /// Information about an individual resolution level or associated image in an SVS file.
 class SvsImageInfo {
   /// Image width in pixels.
@@ -88,4 +91,24 @@ class SvsMetadata {
   @override
   String toString() =>
       'SvsMetadata(width: $width, height: $height, tileWidth: $tileWidth, tileHeight: $tileHeight, compression: $compression, properties: $properties)';
+}
+
+/// Represents an open SVS file handle and TIFF header information.
+class SvsFile {
+  /// The underlying random access file handle.
+  final RandomAccessFile raf;
+
+  /// The byte order (endianness) of the TIFF/SVS file.
+  final Endian endian;
+
+  /// Byte offset to the first Image File Directory (IFD).
+  final int firstIfdOffset;
+
+  /// Creates an [SvsFile] instance.
+  SvsFile(this.raf, this.endian, this.firstIfdOffset);
+
+  /// Closes the underlying file handle.
+  Future<void> close() async {
+    await raf.close();
+  }
 }
