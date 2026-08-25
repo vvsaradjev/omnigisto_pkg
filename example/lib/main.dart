@@ -32,7 +32,7 @@ class _TestScreenState extends State<TestScreen> {
   String _logs = "Press button to start test...\n";
 
   Uint8List? _picBytes;
-  Uint8List? _tileBytes;
+  List<Uint8List?> _tileBytes = [];
 
   void _log(String message) {
     setState(() {
@@ -54,12 +54,19 @@ class _TestScreenState extends State<TestScreen> {
     }
   }
 
-  void _tile(img.Image tile) {
-    final Uint8List? tmp = Uint8List.fromList(img.encodeJpg(tile));
+  void _tile(List<img.Image?> tile) {
+
+    List<Uint8List?> tmp = [];
+    for (var i = 0; i < tile.length -1; i++) {
+        if (tile[i] != null) {
+            tmp.add(Uint8List.fromList(img.encodeJpg(tile[i]!)));
+        }
+    }
+
     setState(() {
       _tileBytes = tmp;
     });
-    if (_tileBytes == null) {
+    if (_tileBytes.isEmpty) {
       _log(" NO tile Found");
     }
 
@@ -133,6 +140,10 @@ class _TestScreenState extends State<TestScreen> {
           const showType = 'thumbnail';
 
           final img.Image? pic = await extractSvsImageAsImage(svs, showType);
+
+
+
+
           if (pic == null) {
             _log("  Failed to extract ${showType} pic");
           } else {
@@ -140,13 +151,18 @@ class _TestScreenState extends State<TestScreen> {
             _pic(pic, showType);
           }
 
-          final img.Image? tile = await extractSvsTileAsImage(svs, 0, 0,0);
 
-          if (tile == null) {
+          // async upload
+          List<img.Image?> tiles = await Future.wait(
+            List.generate(20, (i) => extractSvsTileAsImage(svs, 0, i, 0)),
+          );
+
+
+          if (tiles.isEmpty) {
             _log("  Failed to extract tile");
           } else {
             _log(" Extracted tile");
-            _tile(tile);
+            _tile(tiles);
           }
 
         }
@@ -158,6 +174,10 @@ class _TestScreenState extends State<TestScreen> {
     } catch (e) {
       _log("Test ended with error: $e");
     }
+  }
+
+  Future<img.Image?> uploadTile(SvsFile svs, layer, indexX, indexY) async {
+    return await extractSvsTileAsImage(svs, 0, 0, 0);
   }
 
   @override
@@ -175,10 +195,18 @@ class _TestScreenState extends State<TestScreen> {
             if (_picBytes != null)
               Image.memory(_picBytes!),
             SizedBox(height: 30,),
-            if (_tileBytes != null)
-              Text("!!!!ZERO LEVEL FIRST TILE !!!!!"),
-            if (_tileBytes != null)
-                Image.memory(_tileBytes!),
+            if (_tileBytes.isNotEmpty)
+              Text("!!!!ZERO LEVEL TILEs !!!!!"),
+            if (_tileBytes.isNotEmpty)
+              Row(children: [
+                ..._tileBytes.map((element) {
+                  return Image.memory(element!);
+                }),
+              ],)
+
+
+
+
           ]
         ),
       ),

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -104,11 +105,48 @@ class SvsFile {
   /// Byte offset to the first Image File Directory (IFD).
   final int firstIfdOffset;
 
+  /// Internal synchronization lock to serialize access to [raf] across concurrent operations.
+  Future<void>? _lastOp;
+
+  /// Internal cache for tiled levels.
+  Object? cachedTiledLevels;
+
+  /// Internal cache for global JPEG tables.
+  Uint8List? cachedGlobalJpegTables;
+
   /// Creates an [SvsFile] instance.
   SvsFile(this.raf, this.endian, this.firstIfdOffset);
 
+  /// Executes [action] sequentially to guarantee concurrency-safe access to [raf].
+  Future<T> synchronized<T>(Future<T> Function() action) {
+    final prev = _lastOp;
+    final completer = Completer<void>();
+    _lastOp = completer.future;
+
+    return Future.sync(() async {
+      if (prev != null) {
+        try {
+          await prev;
+        } catch (_) {}
+      }
+      return await action();
+    }).whenComplete(() {
+      completer.complete();
+    });
+  }
+
+  /// Atomically sets position to [offset] and reads [count] bytes from [raf].
+  Future<Uint8List> readBytesAt(int offset, int count) {
+    return synchronized(() async {
+      await raf.setPosition(offset);
+      return await raf.read(count);
+    });
+  }
+
   /// Closes the underlying file handle.
   Future<void> close() async {
-    await raf.close();
+    await synchronized(() async {
+      await raf.close();
+    });
   }
 }

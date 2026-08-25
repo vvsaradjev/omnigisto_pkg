@@ -7,3 +7,6 @@
 * Export changes
 * Example added
 * bug fixes
+
+## 0.0.2-alfa.1
+* Async upload of the tiles, without mutex
