@@ -1,19 +1,18 @@
 // //
 // Copyright (c) 2026, Vladislav Saradzev
+// Vanadzor
 // All rights reserved.
-
+// Beta version use on you own risk )
 
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:image/image.dart' as img;
+import 'package:jpeg2000/jpeg2000.dart';
 import 'package:omnigisto_pkg/types/types.dart';
 
-
-
-export 'types/types.dart';
-
-/// Opens an SVS file at the specified [path] and reads its TIFF header.
+/// Opens an SVS file at the specified [path] and reads its TIFF/BigTIFF header.
 ///
+/// Supports both standard TIFF (Magic 42) and BigTIFF (Magic 43, 64-bit offsets).
 /// Returns an [SvsFile] instance if the file is a valid SVS/TIFF file, or `null` if opening or validation fails.
 Future<SvsFile?> openSvsFile(String path) async {
   final file = File(path);
@@ -21,7 +20,7 @@ Future<SvsFile?> openSvsFile(String path) async {
 
   final raf = await file.open();
   try {
-    final headerBytes = await raf.read(8);
+    final headerBytes = await raf.read(16);
     if (headerBytes.length < 8) {
       await raf.close();
       return null;
@@ -40,13 +39,28 @@ Future<SvsFile?> openSvsFile(String path) async {
     }
 
     final magic = bd.getUint16(2, endian);
-    if (magic != 42) {
+    if (magic == 42) {
+      // Standard TIFF (32-bit offsets)
+      final ifdOffset = bd.getUint32(4, endian);
+      return SvsFile(raf, endian, ifdOffset, false);
+    } else if (magic == 43) {
+      // BigTIFF (64-bit offsets)
+      if (headerBytes.length < 16) {
+        await raf.close();
+        return null;
+      }
+      final offsetByteSize = bd.getUint16(4, endian);
+      final unused = bd.getUint16(6, endian);
+      if (offsetByteSize != 8 || unused != 0) {
+        await raf.close();
+        return null;
+      }
+      final ifdOffset = bd.getUint64(8, endian);
+      return SvsFile(raf, endian, ifdOffset, true);
+    } else {
       await raf.close();
       return null;
     }
-
-    int ifdOffset = bd.getUint32(4, endian);
-    return SvsFile(raf, endian, ifdOffset);
   } catch (e) {
     await raf.close();
     return null;
@@ -62,14 +76,12 @@ Future<Uint8List?> extractSvsImage(SvsFile svs, String type) async {
   return await svs.synchronized(() async {
     final raf = svs.raf;
     final endian = svs.endian;
+    final isBigTiff = svs.isBigTiff;
     int ifdOffset = svs.firstIfdOffset;
 
     while (ifdOffset != 0) {
-      await raf.setPosition(ifdOffset);
-      final numEntriesBytes = await raf.read(2);
-      if (numEntriesBytes.length < 2) break;
-
-      final numEntries = ByteData.sublistView(numEntriesBytes).getUint16(0, endian);
+      final header = await _readIfdHeader(raf, ifdOffset, endian, isBigTiff);
+      if (header == null) break;
 
       int width = 0;
       int height = 0;
@@ -79,64 +91,46 @@ Future<Uint8List?> extractSvsImage(SvsFile svs, String type) async {
       List<int> stripOffsets = [];
       List<int> stripByteCounts = [];
 
-      int nextIfdOffsetPos = ifdOffset + 2 + numEntries * 12;
+      for (var i = 0; i < header.numEntries; i++) {
+        final entry = await _readIfdEntry(raf, endian, isBigTiff);
+        if (entry == null) break;
 
-      for (var i = 0; i < numEntries; i++) {
-        final entryBytes = await raf.read(12);
-        if (entryBytes.length < 12) break;
-        final entryBd = ByteData.sublistView(entryBytes);
-
-        final tag = entryBd.getUint16(0, endian);
-        final dataType = entryBd.getUint16(2, endian);
-        final count = entryBd.getUint32(4, endian);
-        final valueOffset = entryBd.getUint32(8, endian);
-
-        if (tag == 256) {
-          width = _readTiffValue(dataType, count, valueOffset, entryBd, 8, endian);
-        } else if (tag == 257) {
-          height = _readTiffValue(dataType, count, valueOffset, entryBd, 8, endian);
-        } else if (tag == 322) {
-          tileWidth = _readTiffValue(dataType, count, valueOffset, entryBd, 8, endian);
-        } else if (tag == 323) {
-          tileHeight = _readTiffValue(dataType, count, valueOffset, entryBd, 8, endian);
-        } else if (tag == 273) {
-          stripOffsets = await _readTiffArray(raf, dataType, count, valueOffset, endian);
-        } else if (tag == 279) {
-          stripByteCounts = await _readTiffArray(raf, dataType, count, valueOffset, endian);
-        } else if (tag == 270) {
-          final currentPos = await raf.position();
-          await raf.setPosition(valueOffset);
-          final descBytes = await raf.read(count);
-          var length = descBytes.length;
-          if (length > 0 && descBytes[length - 1] == 0) length--;
-          description = String.fromCharCodes(descBytes.sublist(0, length)).trim();
-          await raf.setPosition(currentPos);
+        if (entry.tag == 256) {
+          width = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 257) {
+          height = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 322) {
+          tileWidth = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 323) {
+          tileHeight = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 273) {
+          stripOffsets = await _readTiffArray(raf, entry.dataType, entry.count, entry.valueOffset, endian, inlineMaxBytes: entry.inlineMaxBytes, entryBd: entry.entryBd, offsetInEntry: entry.offsetInEntry);
+        } else if (entry.tag == 279) {
+          stripByteCounts = await _readTiffArray(raf, entry.dataType, entry.count, entry.valueOffset, endian, inlineMaxBytes: entry.inlineMaxBytes, entryBd: entry.entryBd, offsetInEntry: entry.offsetInEntry);
+        } else if (entry.tag == 270) {
+          description = await _readTiffString(raf, entry.count, entry.valueOffset, inlineMaxBytes: entry.inlineMaxBytes, entryBd: entry.entryBd, offsetInEntry: entry.offsetInEntry);
         }
       }
 
-      // Determine the type of the current image
       String? currentImageType = _determineImageType(description, width, height, tileWidth, tileHeight);
 
       if (currentImageType == type) {
         if (stripOffsets.isEmpty || stripByteCounts.isEmpty) {
-          // Try looking for TileOffsets if StripOffsets is empty (for tiled layers).
-          // However, extractSvsImage is typically used for non-tiled associations.
           return null;
         }
 
-        BytesBuilder bb = BytesBuilder();
+        final bb = BytesBuilder();
         for (int i = 0; i < stripOffsets.length; i++) {
-          await raf.setPosition(stripOffsets[i]);
-          final bytes = await raf.read(stripByteCounts[i]);
+          final offset = stripOffsets[i];
+          final count = stripByteCounts[i];
+          await raf.setPosition(offset);
+          final bytes = await raf.read(count);
           bb.add(bytes);
         }
         return bb.takeBytes();
       }
 
-      await raf.setPosition(nextIfdOffsetPos);
-      final nextIfdBytes = await raf.read(4);
-      if (nextIfdBytes.length < 4) break;
-      ifdOffset = ByteData.sublistView(nextIfdBytes).getUint32(0, endian);
+      ifdOffset = await _readNextIfdOffset(raf, header.nextIfdOffsetPos, endian, isBigTiff);
     }
 
     return null;
@@ -145,7 +139,7 @@ Future<Uint8List?> extractSvsImage(SvsFile svs, String type) async {
 
 /// Extracts an associated image (e.g. 'thumbnail', 'label', or 'macro') from an SVS file and returns it as a decoded [img.Image].
 ///
-/// Handles decompression (JPEG strips with JPEGTables, LZW with predictor, uncompressed RGB, Deflate)
+/// Handles decompression (JPEG strips with JPEGTables, JPEG 2000, LZW with predictor, uncompressed RGB, Deflate)
 /// and stitches multi-strip images into a unified [img.Image].
 ///
 /// [svs] is the open [SvsFile].
@@ -162,15 +156,13 @@ Future<img.Image?> extractSvsImageAsImage(
   return await svs.synchronized(() async {
     final raf = svs.raf;
     final endian = svs.endian;
+    final isBigTiff = svs.isBigTiff;
     int ifdOffset = svs.firstIfdOffset;
     Uint8List? globalJpegTables;
 
     while (ifdOffset != 0) {
-      await raf.setPosition(ifdOffset);
-      final numEntriesBytes = await raf.read(2);
-      if (numEntriesBytes.length < 2) break;
-
-      final numEntries = ByteData.sublistView(numEntriesBytes).getUint16(0, endian);
+      final header = await _readIfdHeader(raf, ifdOffset, endian, isBigTiff);
+      if (header == null) break;
 
       int width = 0;
       int height = 0;
@@ -188,61 +180,47 @@ Future<img.Image?> extractSvsImageAsImage(
       Uint8List? iccProfile;
       List<int>? colorMap;
 
-      int nextIfdOffsetPos = ifdOffset + 2 + numEntries * 12;
+      for (var i = 0; i < header.numEntries; i++) {
+        final entry = await _readIfdEntry(raf, endian, isBigTiff);
+        if (entry == null) break;
 
-      for (var i = 0; i < numEntries; i++) {
-        final entryBytes = await raf.read(12);
-        if (entryBytes.length < 12) break;
-        final entryBd = ByteData.sublistView(entryBytes);
-
-        final tag = entryBd.getUint16(0, endian);
-        final dataType = entryBd.getUint16(2, endian);
-        final count = entryBd.getUint32(4, endian);
-        final valueOffset = entryBd.getUint32(8, endian);
-
-        if (tag == 256) {
-          width = _readTiffValue(dataType, count, valueOffset, entryBd, 8, endian);
-        } else if (tag == 257) {
-          height = _readTiffValue(dataType, count, valueOffset, entryBd, 8, endian);
-        } else if (tag == 259) {
-          compression = _readTiffValue(dataType, count, valueOffset, entryBd, 8, endian);
-        } else if (tag == 262) {
-          photometricInterpretation = _readTiffValue(dataType, count, valueOffset, entryBd, 8, endian);
-        } else if (tag == 273) {
-          stripOffsets = await _readTiffArray(raf, dataType, count, valueOffset, endian);
-        } else if (tag == 277) {
-          samplesPerPixel = _readTiffValue(dataType, count, valueOffset, entryBd, 8, endian);
-        } else if (tag == 278) {
-          rowsPerStrip = _readTiffValue(dataType, count, valueOffset, entryBd, 8, endian);
-        } else if (tag == 279) {
-          stripByteCounts = await _readTiffArray(raf, dataType, count, valueOffset, endian);
-        } else if (tag == 317) {
-          predictor = _readTiffValue(dataType, count, valueOffset, entryBd, 8, endian);
-        } else if (tag == 320) {
-          colorMap = await _readTiffArray(raf, dataType, count, valueOffset, endian);
-        } else if (tag == 322) {
-          tileWidth = _readTiffValue(dataType, count, valueOffset, entryBd, 8, endian);
-        } else if (tag == 323) {
-          tileHeight = _readTiffValue(dataType, count, valueOffset, entryBd, 8, endian);
-        } else if (tag == 347) {
+        if (entry.tag == 256) {
+          width = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 257) {
+          height = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 259) {
+          compression = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 262) {
+          photometricInterpretation = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 273) {
+          stripOffsets = await _readTiffArray(raf, entry.dataType, entry.count, entry.valueOffset, endian, inlineMaxBytes: entry.inlineMaxBytes, entryBd: entry.entryBd, offsetInEntry: entry.offsetInEntry);
+        } else if (entry.tag == 277) {
+          samplesPerPixel = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 278) {
+          rowsPerStrip = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 279) {
+          stripByteCounts = await _readTiffArray(raf, entry.dataType, entry.count, entry.valueOffset, endian, inlineMaxBytes: entry.inlineMaxBytes, entryBd: entry.entryBd, offsetInEntry: entry.offsetInEntry);
+        } else if (entry.tag == 317) {
+          predictor = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 320) {
+          colorMap = await _readTiffArray(raf, entry.dataType, entry.count, entry.valueOffset, endian, inlineMaxBytes: entry.inlineMaxBytes, entryBd: entry.entryBd, offsetInEntry: entry.offsetInEntry);
+        } else if (entry.tag == 322) {
+          tileWidth = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 323) {
+          tileHeight = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 347) {
           final currentPos = await raf.position();
-          await raf.setPosition(valueOffset);
-          jpegTables = await raf.read(count);
+          await raf.setPosition(entry.valueOffset);
+          jpegTables = await raf.read(entry.count);
           globalJpegTables ??= jpegTables;
           await raf.setPosition(currentPos);
-        } else if (tag == 34675) {
+        } else if (entry.tag == 34675) {
           final currentPos = await raf.position();
-          await raf.setPosition(valueOffset);
-          iccProfile = await raf.read(count);
+          await raf.setPosition(entry.valueOffset);
+          iccProfile = await raf.read(entry.count);
           await raf.setPosition(currentPos);
-        } else if (tag == 270) {
-          final currentPos = await raf.position();
-          await raf.setPosition(valueOffset);
-          final descBytes = await raf.read(count);
-          var length = descBytes.length;
-          if (length > 0 && descBytes[length - 1] == 0) length--;
-          description = String.fromCharCodes(descBytes.sublist(0, length)).trim();
-          await raf.setPosition(currentPos);
+        } else if (entry.tag == 270) {
+          description = await _readTiffString(raf, entry.count, entry.valueOffset, inlineMaxBytes: entry.inlineMaxBytes, entryBd: entry.entryBd, offsetInEntry: entry.offsetInEntry);
         }
       }
 
@@ -252,7 +230,6 @@ Future<img.Image?> extractSvsImageAsImage(
 
       jpegTables ??= globalJpegTables;
 
-      // Determine the type of the current image
       String? currentImageType = _determineImageType(description, width, height, tileWidth, tileHeight);
 
       if (currentImageType == type) {
@@ -292,6 +269,26 @@ Future<img.Image?> extractSvsImageAsImage(
                   stripImg = null;
                 }
               }
+              if (stripImg != null) {
+                img.compositeImage(fullImage, stripImg, dstY: i * rowsPerStrip);
+              }
+            }
+            if (applyColorScheme) {
+              if (photometricInterpretation == 0) {
+                _applyWhiteIsZero(fullImage);
+              }
+              if (iccProfile != null && iccProfile.length <= 65519) {
+                fullImage.iccProfile = img.IccProfile('', img.IccProfileCompression.none, iccProfile);
+              }
+            }
+            return fullImage;
+          } else if (compression == 33003 || compression == 33005 || compression == 34712) {
+            final fullImage = img.Image(width: width, height: height, numChannels: 4);
+            for (int i = 0; i < stripOffsets.length; i++) {
+              await raf.setPosition(stripOffsets[i]);
+              var stripBytes = await raf.read(stripByteCounts[i]);
+              img.Image? stripImg = _decodeJpeg2000(stripBytes);
+              stripImg ??= img.decodeImage(stripBytes);
               if (stripImg != null) {
                 img.compositeImage(fullImage, stripImg, dstY: i * rowsPerStrip);
               }
@@ -432,6 +429,7 @@ Future<img.Image?> extractSvsImageAsImage(
             }
             final rawBytes = bb.takeBytes();
             var image = img.decodeImage(rawBytes);
+            image ??= _decodeJpeg2000(rawBytes);
             if (image != null && applyColorScheme) {
               image = _applyColorSchemeToImage(
                 image,
@@ -448,10 +446,7 @@ Future<img.Image?> extractSvsImageAsImage(
         }
       }
 
-      await raf.setPosition(nextIfdOffsetPos);
-      final nextIfdBytes = await raf.read(4);
-      if (nextIfdBytes.length < 4) break;
-      ifdOffset = ByteData.sublistView(nextIfdBytes).getUint32(0, endian);
+      ifdOffset = await _readNextIfdOffset(raf, header.nextIfdOffsetPos, endian, isBigTiff);
     }
 
     return null;
@@ -460,7 +455,7 @@ Future<img.Image?> extractSvsImageAsImage(
 
 /// Extracts an associated image (e.g. 'thumbnail', 'label', or 'macro') from an SVS file and returns it as encoded JPEG bytes.
 ///
-/// Handles decompression (JPEG strips with JPEGTables, LZW with predictor, uncompressed RGB, Deflate)
+/// Handles decompression (JPEG strips with JPEGTables, JPEG 2000, LZW with predictor, uncompressed RGB, Deflate)
 /// and stitches multi-strip images into a unified JPEG image.
 ///
 /// [svs] is the open [SvsFile].
@@ -530,43 +525,40 @@ class _TiledLevelFullData {
 Future<({List<_TiledLevelInfo> levels, Uint8List? globalJpegTables})> _collectTiledLevels(SvsFile svs) async {
   final raf = svs.raf;
   final endian = svs.endian;
+  final isBigTiff = svs.isBigTiff;
   int ifdOffset = svs.firstIfdOffset;
 
   List<_TiledLevelInfo> levels = [];
   Uint8List? globalJpegTables;
 
   while (ifdOffset != 0) {
-    await raf.setPosition(ifdOffset);
-    final numEntriesBytes = await raf.read(2);
-    if (numEntriesBytes.length < 2) break;
-    final numEntries = ByteData.sublistView(numEntriesBytes).getUint16(0, endian);
+    final header = await _readIfdHeader(raf, ifdOffset, endian, isBigTiff);
+    if (header == null) break;
 
     int width = 0;
     int height = 0;
     int? tileWidth;
     int? tileHeight;
+    List<int> subIfdOffsets = [];
 
-    for (var i = 0; i < numEntries; i++) {
-      final entryBytes = await raf.read(12);
-      if (entryBytes.length < 12) break;
-      final entryBd = ByteData.sublistView(entryBytes);
-      final tag = entryBd.getUint16(0, endian);
-      final type = entryBd.getUint16(2, endian);
-      final count = entryBd.getUint32(4, endian);
-      final valueOffset = entryBd.getUint32(8, endian);
+    for (var i = 0; i < header.numEntries; i++) {
+      final entry = await _readIfdEntry(raf, endian, isBigTiff);
+      if (entry == null) break;
 
-      if (tag == 256) {
-        width = _readTiffValue(type, count, valueOffset, entryBd, 8, endian);
-      } else if (tag == 257) {
-        height = _readTiffValue(type, count, valueOffset, entryBd, 8, endian);
-      } else if (tag == 322) {
-        tileWidth = _readTiffValue(type, count, valueOffset, entryBd, 8, endian);
-      } else if (tag == 323) {
-        tileHeight = _readTiffValue(type, count, valueOffset, entryBd, 8, endian);
-      } else if (tag == 347 && globalJpegTables == null) {
+      if (entry.tag == 256) {
+        width = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+      } else if (entry.tag == 257) {
+        height = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+      } else if (entry.tag == 322) {
+        tileWidth = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+      } else if (entry.tag == 323) {
+        tileHeight = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+      } else if (entry.tag == 330) {
+        subIfdOffsets = await _readTiffArray(raf, entry.dataType, entry.count, entry.valueOffset, endian, inlineMaxBytes: entry.inlineMaxBytes, entryBd: entry.entryBd, offsetInEntry: entry.offsetInEntry);
+      } else if (entry.tag == 347 && globalJpegTables == null) {
         final currentPos = await raf.position();
-        await raf.setPosition(valueOffset);
-        globalJpegTables = await raf.read(count);
+        await raf.setPosition(entry.valueOffset);
+        globalJpegTables = await raf.read(entry.count);
         await raf.setPosition(currentPos);
       }
     }
@@ -581,10 +573,42 @@ Future<({List<_TiledLevelInfo> levels, Uint8List? globalJpegTables})> _collectTi
       ));
     }
 
-    await raf.setPosition(ifdOffset + 2 + numEntries * 12);
-    final nextIfdBytes = await raf.read(4);
-    if (nextIfdBytes.length < 4) break;
-    ifdOffset = ByteData.sublistView(nextIfdBytes).getUint32(0, endian);
+    // Process SubIFDs if present
+    for (final subIfd in subIfdOffsets) {
+      if (subIfd != 0) {
+        final subHeader = await _readIfdHeader(raf, subIfd, endian, isBigTiff);
+        if (subHeader != null) {
+          int sWidth = 0;
+          int sHeight = 0;
+          int? sTileWidth;
+          int? sTileHeight;
+          for (var i = 0; i < subHeader.numEntries; i++) {
+            final entry = await _readIfdEntry(raf, endian, isBigTiff);
+            if (entry == null) break;
+            if (entry.tag == 256) {
+              sWidth = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+            } else if (entry.tag == 257) {
+              sHeight = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+            } else if (entry.tag == 322) {
+              sTileWidth = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+            } else if (entry.tag == 323) {
+              sTileHeight = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+            }
+          }
+          if (sTileWidth != null && sTileHeight != null && sWidth > 0 && sHeight > 0) {
+            levels.add(_TiledLevelInfo(
+              ifdOffset: subIfd,
+              width: sWidth,
+              height: sHeight,
+              tileWidth: sTileWidth,
+              tileHeight: sTileHeight,
+            ));
+          }
+        }
+      }
+    }
+
+    ifdOffset = await _readNextIfdOffset(raf, header.nextIfdOffsetPos, endian, isBigTiff);
   }
 
   levels.sort((a, b) => b.width.compareTo(a.width));
@@ -630,12 +654,11 @@ Future<_TiledLevelFullData?> _getOrLoadLevelFullData(
 
     final raf = svs.raf;
     final endian = svs.endian;
+    final isBigTiff = svs.isBigTiff;
     final targetIfd = targetLevel.ifdOffset;
 
-    await raf.setPosition(targetIfd);
-    final numEntriesBytes = await raf.read(2);
-    if (numEntriesBytes.length < 2) return null;
-    final numEntries = ByteData.sublistView(numEntriesBytes).getUint16(0, endian);
+    final header = await _readIfdHeader(raf, targetIfd, endian, isBigTiff);
+    if (header == null) return null;
 
     int compression = 1;
     int samplesPerPixel = 3;
@@ -647,38 +670,33 @@ Future<_TiledLevelFullData?> _getOrLoadLevelFullData(
     Uint8List? iccProfile;
     List<int>? colorMap;
 
-    for (var i = 0; i < numEntries; i++) {
-      final entryBytes = await raf.read(12);
-      if (entryBytes.length < 12) break;
-      final entryBd = ByteData.sublistView(entryBytes);
-      final tag = entryBd.getUint16(0, endian);
-      final type = entryBd.getUint16(2, endian);
-      final count = entryBd.getUint32(4, endian);
-      final valueOffset = entryBd.getUint32(8, endian);
+    for (var i = 0; i < header.numEntries; i++) {
+      final entry = await _readIfdEntry(raf, endian, isBigTiff);
+      if (entry == null) break;
 
-      if (tag == 259) {
-        compression = _readTiffValue(type, count, valueOffset, entryBd, 8, endian);
-      } else if (tag == 262) {
-        photometricInterpretation = _readTiffValue(type, count, valueOffset, entryBd, 8, endian);
-      } else if (tag == 277) {
-        samplesPerPixel = _readTiffValue(type, count, valueOffset, entryBd, 8, endian);
-      } else if (tag == 317) {
-        predictor = _readTiffValue(type, count, valueOffset, entryBd, 8, endian);
-      } else if (tag == 320) {
-        colorMap = await _readTiffArray(raf, type, count, valueOffset, endian);
-      } else if (tag == 324) {
-        tileOffsets = await _readTiffArray(raf, type, count, valueOffset, endian);
-      } else if (tag == 325) {
-        tileByteCounts = await _readTiffArray(raf, type, count, valueOffset, endian);
-      } else if (tag == 347) {
+      if (entry.tag == 259) {
+        compression = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+      } else if (entry.tag == 262) {
+        photometricInterpretation = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+      } else if (entry.tag == 277) {
+        samplesPerPixel = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+      } else if (entry.tag == 317) {
+        predictor = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+      } else if (entry.tag == 320) {
+        colorMap = await _readTiffArray(raf, entry.dataType, entry.count, entry.valueOffset, endian, inlineMaxBytes: entry.inlineMaxBytes, entryBd: entry.entryBd, offsetInEntry: entry.offsetInEntry);
+      } else if (entry.tag == 324) {
+        tileOffsets = await _readTiffArray(raf, entry.dataType, entry.count, entry.valueOffset, endian, inlineMaxBytes: entry.inlineMaxBytes, entryBd: entry.entryBd, offsetInEntry: entry.offsetInEntry);
+      } else if (entry.tag == 325) {
+        tileByteCounts = await _readTiffArray(raf, entry.dataType, entry.count, entry.valueOffset, endian, inlineMaxBytes: entry.inlineMaxBytes, entryBd: entry.entryBd, offsetInEntry: entry.offsetInEntry);
+      } else if (entry.tag == 347) {
         final currentPos = await raf.position();
-        await raf.setPosition(valueOffset);
-        jpegTables = await raf.read(count);
+        await raf.setPosition(entry.valueOffset);
+        jpegTables = await raf.read(entry.count);
         await raf.setPosition(currentPos);
-      } else if (tag == 34675) {
+      } else if (entry.tag == 34675) {
         final currentPos = await raf.position();
-        await raf.setPosition(valueOffset);
-        iccProfile = await raf.read(count);
+        await raf.setPosition(entry.valueOffset);
+        iccProfile = await raf.read(entry.count);
         await raf.setPosition(currentPos);
       }
     }
@@ -745,7 +763,7 @@ Future<Uint8List?> extractSvsTile(SvsFile svs, int layerIndex, int tileX, int ti
 
 /// Extracts a specific tile from a resolution layer in the SVS file and returns it as a decoded [img.Image].
 ///
-/// Handles decompression (JPEG tiles with JPEGTables, LZW with predictor, uncompressed RGB, Deflate).
+/// Handles decompression (JPEG tiles with JPEGTables, JPEG 2000, LZW with predictor, uncompressed RGB, Deflate).
 ///
 /// [svs] is the open [SvsFile].
 /// [layerIndex] is the resolution layer index (0 is the highest resolution / baseline level).
@@ -797,7 +815,6 @@ Future<img.Image?> extractSvsTileAsImage(
     return blank;
   }
 
-  // Atomically read raw tile bytes (critical section: ~0.1 ms)
   final rawTileBytes = await svs.readBytesAt(offset, byteCount);
 
   if (rawTileBytes.isEmpty) {
@@ -810,7 +827,6 @@ Future<img.Image?> extractSvsTileAsImage(
     return blank;
   }
 
-  // Decompression and color scheme processing happen outside the lock (parallel on CPU)
   return _decodeTileBytes(
     rawTileBytes: rawTileBytes,
     tileWidth: targetLevel.tileWidth,
@@ -819,13 +835,14 @@ Future<img.Image?> extractSvsTileAsImage(
     samplesPerPixel: fullData.samplesPerPixel,
     predictor: fullData.predictor,
     photometricInterpretation: fullData.photometricInterpretation,
+    applyColorScheme: applyColorScheme,
     jpegTables: fullData.jpegTables,
     iccProfile: fullData.iccProfile,
     colorMap: fullData.colorMap,
-    applyColorScheme: applyColorScheme,
   );
 }
 
+/// Internal helper for decoding tile bytes with given format settings.
 img.Image? _decodeTileBytes({
   required Uint8List rawTileBytes,
   required int tileWidth,
@@ -834,16 +851,16 @@ img.Image? _decodeTileBytes({
   required int samplesPerPixel,
   required int predictor,
   required int photometricInterpretation,
+  required bool applyColorScheme,
   required Uint8List? jpegTables,
   required Uint8List? iccProfile,
   required List<int>? colorMap,
-  required bool applyColorScheme,
 }) {
   try {
     if (compression == 7 || compression == 6) {
       var tileBytes = rawTileBytes;
       if (jpegTables != null) {
-        tileBytes = _combineJpegWithTables(tileBytes, jpegTables);
+        tileBytes = _combineJpegWithTables(rawTileBytes, jpegTables);
       }
 
       img.Image? tileImg;
@@ -873,6 +890,17 @@ img.Image? _decodeTileBytes({
         }
       }
 
+      if (tileImg != null && applyColorScheme) {
+        if (photometricInterpretation == 0) {
+          _applyWhiteIsZero(tileImg);
+        }
+        if (iccProfile != null && iccProfile.length <= 65519) {
+          tileImg.iccProfile = img.IccProfile('', img.IccProfileCompression.none, iccProfile);
+        }
+      }
+      return tileImg;
+    } else if (compression == 33003 || compression == 33005 || compression == 34712) {
+      var tileImg = _decodeJpeg2000(rawTileBytes);
       if (tileImg != null && applyColorScheme) {
         if (photometricInterpretation == 0) {
           _applyWhiteIsZero(tileImg);
@@ -953,6 +981,7 @@ img.Image? _decodeTileBytes({
       return tileImg;
     } else {
       var tileImg = img.decodeImage(rawTileBytes);
+      tileImg ??= _decodeJpeg2000(rawTileBytes);
       if (tileImg != null && applyColorScheme) {
         tileImg = _applyColorSchemeToImage(
           tileImg,
@@ -969,45 +998,239 @@ img.Image? _decodeTileBytes({
   }
 }
 
+class _TiffIfdHeader {
+  final int numEntries;
+  final int nextIfdOffsetPos;
 
+  const _TiffIfdHeader(this.numEntries, this.nextIfdOffsetPos);
+}
 
+class _TiffEntry {
+  final int tag;
+  final int dataType;
+  final int count;
+  final int valueOffset;
+  final ByteData entryBd;
+  final int offsetInEntry;
+  final int inlineMaxBytes;
 
-/// Helper function to read an array of values from TIFF.
-Future<List<int>> _readTiffArray(RandomAccessFile raf, int type, int count, int valueOffset, Endian endian) async {
-  if (count == 0) return const [];
+  const _TiffEntry({
+    required this.tag,
+    required this.dataType,
+    required this.count,
+    required this.valueOffset,
+    required this.entryBd,
+    required this.offsetInEntry,
+    required this.inlineMaxBytes,
+  });
+}
 
-  int elementSize = 0;
-  if (type == 3) {
-    elementSize = 2; // SHORT
-  } else if (type == 4) {
-    elementSize = 4; // LONG
+Future<_TiffIfdHeader?> _readIfdHeader(
+  RandomAccessFile raf,
+  int ifdOffset,
+  Endian endian,
+  bool isBigTiff,
+) async {
+  if (ifdOffset <= 0) return null;
+  await raf.setPosition(ifdOffset);
+  if (isBigTiff) {
+    final numEntriesBytes = await raf.read(8);
+    if (numEntriesBytes.length < 8) return null;
+    final numEntries = ByteData.sublistView(numEntriesBytes).getUint64(0, endian);
+    final nextIfdOffsetPos = ifdOffset + 8 + numEntries * 20;
+    return _TiffIfdHeader(numEntries, nextIfdOffsetPos);
   } else {
-    return const [];
+    final numEntriesBytes = await raf.read(2);
+    if (numEntriesBytes.length < 2) return null;
+    final numEntries = ByteData.sublistView(numEntriesBytes).getUint16(0, endian);
+    final nextIfdOffsetPos = ifdOffset + 2 + numEntries * 12;
+    return _TiffIfdHeader(numEntries, nextIfdOffsetPos);
   }
+}
 
-  if (count * elementSize <= 4) {
-    final result = List<int>.filled(count, 0);
-    final bd = ByteData(4);
-    bd.setUint32(0, valueOffset, endian);
-    for (int i = 0; i < count; i++) {
-      result[i] = (type == 3) ? bd.getUint16(i * 2, endian) : bd.getUint32(i * 4, endian);
-    }
-    return result;
+Future<_TiffEntry?> _readIfdEntry(
+  RandomAccessFile raf,
+  Endian endian,
+  bool isBigTiff,
+) async {
+  if (isBigTiff) {
+    final entryBytes = await raf.read(20);
+    if (entryBytes.length < 20) return null;
+    final entryBd = ByteData.sublistView(entryBytes);
+    final tag = entryBd.getUint16(0, endian);
+    final dataType = entryBd.getUint16(2, endian);
+    final count = entryBd.getUint64(4, endian);
+    final valueOffset = entryBd.getUint64(12, endian);
+    return _TiffEntry(
+      tag: tag,
+      dataType: dataType,
+      count: count,
+      valueOffset: valueOffset,
+      entryBd: entryBd,
+      offsetInEntry: 12,
+      inlineMaxBytes: 8,
+    );
+  } else {
+    final entryBytes = await raf.read(12);
+    if (entryBytes.length < 12) return null;
+    final entryBd = ByteData.sublistView(entryBytes);
+    final tag = entryBd.getUint16(0, endian);
+    final dataType = entryBd.getUint16(2, endian);
+    final count = entryBd.getUint32(4, endian);
+    final valueOffset = entryBd.getUint32(8, endian);
+    return _TiffEntry(
+      tag: tag,
+      dataType: dataType,
+      count: count,
+      valueOffset: valueOffset,
+      entryBd: entryBd,
+      offsetInEntry: 8,
+      inlineMaxBytes: 4,
+    );
+  }
+}
+
+Future<int> _readNextIfdOffset(
+  RandomAccessFile raf,
+  int nextIfdOffsetPos,
+  Endian endian,
+  bool isBigTiff,
+) async {
+  await raf.setPosition(nextIfdOffsetPos);
+  if (isBigTiff) {
+    final nextIfdBytes = await raf.read(8);
+    if (nextIfdBytes.length < 8) return 0;
+    return ByteData.sublistView(nextIfdBytes).getUint64(0, endian);
+  } else {
+    final nextIfdBytes = await raf.read(4);
+    if (nextIfdBytes.length < 4) return 0;
+    return ByteData.sublistView(nextIfdBytes).getUint32(0, endian);
+  }
+}
+
+Future<String?> _readTiffString(
+  RandomAccessFile raf,
+  int count,
+  int valueOffset, {
+  int inlineMaxBytes = 4,
+  ByteData? entryBd,
+  int offsetInEntry = 8,
+}) async {
+  if (count <= 0) return null;
+  Uint8List descBytes;
+  if (count <= inlineMaxBytes && entryBd != null) {
+    descBytes = entryBd.buffer.asUint8List(
+      entryBd.offsetInBytes + offsetInEntry,
+      count,
+    );
   } else {
     final currentPos = await raf.position();
     await raf.setPosition(valueOffset);
-    final bytes = await raf.read(count * elementSize);
+    descBytes = await raf.read(count);
+    await raf.setPosition(currentPos);
+  }
+  var length = descBytes.length;
+  if (length > 0 && descBytes[length - 1] == 0) {
+    length--;
+  }
+  return String.fromCharCodes(descBytes.sublist(0, length)).trim();
+}
+
+int _readTiffValue(
+  int type,
+  int count,
+  int valueOffset,
+  ByteData entryBd,
+  int offsetInEntry,
+  Endian endian,
+) {
+  if (type == 1) { // BYTE
+    return entryBd.getUint8(offsetInEntry);
+  } else if (type == 3) { // SHORT
+    return entryBd.getUint16(offsetInEntry, endian);
+  } else if (type == 4) { // LONG
+    return entryBd.getUint32(offsetInEntry, endian);
+  } else if (type == 16 || type == 18) { // LONG8 or IFD8
+    return entryBd.getUint64(offsetInEntry, endian);
+  } else if (type == 6) { // SBYTE
+    return entryBd.getInt8(offsetInEntry);
+  } else if (type == 8) { // SSHORT
+    return entryBd.getInt16(offsetInEntry, endian);
+  } else if (type == 9) { // SLONG
+    return entryBd.getInt32(offsetInEntry, endian);
+  } else if (type == 17) { // SLONG8
+    return entryBd.getInt64(offsetInEntry, endian);
+  }
+  return valueOffset;
+}
+
+Future<List<int>> _readTiffArray(
+  RandomAccessFile raf,
+  int type,
+  int count,
+  int valueOffset,
+  Endian endian, {
+  int inlineMaxBytes = 4,
+  ByteData? entryBd,
+  int offsetInEntry = 8,
+}) async {
+  if (count <= 0) return const [];
+
+  int elementSize = 0;
+  if (type == 1 || type == 6 || type == 7) {
+    elementSize = 1;
+  } else if (type == 3 || type == 8) {
+    elementSize = 2;
+  } else if (type == 4 || type == 9 || type == 11) {
+    elementSize = 4;
+  } else if (type == 16 || type == 17 || type == 18 || type == 5 || type == 10 || type == 12) {
+    elementSize = 8;
+  } else {
+    elementSize = 4;
+  }
+
+  final totalBytes = count * elementSize;
+  ByteData bd;
+  int baseOffset = 0;
+
+  if (totalBytes <= inlineMaxBytes && entryBd != null) {
+    bd = entryBd;
+    baseOffset = offsetInEntry;
+  } else {
+    final currentPos = await raf.position();
+    await raf.setPosition(valueOffset);
+    final bytes = await raf.read(totalBytes);
     await raf.setPosition(currentPos);
 
-    if (bytes.length < count * elementSize) return const [];
-
-    final bd = ByteData.sublistView(bytes);
-    final result = List<int>.filled(count, 0);
-    for (int i = 0; i < count; i++) {
-      result[i] = (type == 3) ? bd.getUint16(i * 2, endian) : bd.getUint32(i * 4, endian);
-    }
-    return result;
+    if (bytes.length < totalBytes) return const [];
+    bd = ByteData.sublistView(bytes);
+    baseOffset = 0;
   }
+
+  final result = List<int>.filled(count, 0);
+  for (int i = 0; i < count; i++) {
+    final offset = baseOffset + i * elementSize;
+    if (type == 3) {
+      result[i] = bd.getUint16(offset, endian);
+    } else if (type == 4) {
+      result[i] = bd.getUint32(offset, endian);
+    } else if (type == 16 || type == 18) {
+      result[i] = bd.getUint64(offset, endian);
+    } else if (type == 1 || type == 7) {
+      result[i] = bd.getUint8(offset);
+    } else if (type == 8) {
+      result[i] = bd.getInt16(offset, endian);
+    } else if (type == 9) {
+      result[i] = bd.getInt32(offset, endian);
+    } else if (type == 17) {
+      result[i] = bd.getInt64(offset, endian);
+    } else if (type == 6) {
+      result[i] = bd.getInt8(offset);
+    } else {
+      result[i] = bd.getUint32(offset, endian);
+    }
+  }
+  return result;
 }
 
 /// Reads all metadata from the SVS file, including all pyramid levels and associated images.
@@ -1018,16 +1241,14 @@ Future<SvsFullMetadata?> readFullSvsMetadata(SvsFile svs) async {
   return await svs.synchronized(() async {
     final raf = svs.raf;
     final endian = svs.endian;
+    final isBigTiff = svs.isBigTiff;
     int ifdOffset = svs.firstIfdOffset;
 
     List<SvsImageInfo> allImages = [];
 
     while (ifdOffset != 0) {
-      await raf.setPosition(ifdOffset);
-      final numEntriesBytes = await raf.read(2);
-      if (numEntriesBytes.length < 2) break;
-
-      final numEntries = ByteData.sublistView(numEntriesBytes).getUint16(0, endian);
+      final header = await _readIfdHeader(raf, ifdOffset, endian, isBigTiff);
+      if (header == null) break;
 
       int width = 0;
       int height = 0;
@@ -1036,86 +1257,63 @@ Future<SvsFullMetadata?> readFullSvsMetadata(SvsFile svs) async {
       Map<String, String> properties = {};
       String? description;
 
-      for (var i = 0; i < numEntries; i++) {
-        final entryBytes = await raf.read(12);
-        if (entryBytes.length < 12) break;
-        final entryBd = ByteData.sublistView(entryBytes);
+      for (var i = 0; i < header.numEntries; i++) {
+        final entry = await _readIfdEntry(raf, endian, isBigTiff);
+        if (entry == null) break;
 
-        final tag = entryBd.getUint16(0, endian);
-        final type = entryBd.getUint16(2, endian);
-        final count = entryBd.getUint32(4, endian);
-        final valueOffset = entryBd.getUint32(8, endian);
-
-        if (tag == 256) {
-          width = _readTiffValue(type, count, valueOffset, entryBd, 8, endian);
-        } else if (tag == 257) {
-          height = _readTiffValue(type, count, valueOffset, entryBd, 8, endian);
-        } else if (tag == 322) {
-          tileWidth = _readTiffValue(type, count, valueOffset, entryBd, 8, endian);
-        } else if (tag == 323) {
-          tileHeight = _readTiffValue(type, count, valueOffset, entryBd, 8, endian);
-        } else if (tag == 270) {
-          final currentPos = await raf.position();
-          await raf.setPosition(valueOffset);
-          final descBytes = await raf.read(count);
-          var length = descBytes.length;
-          if (length > 0 && descBytes[length - 1] == 0) length--;
-          description = String.fromCharCodes(descBytes.sublist(0, length)).trim();
-          properties = _parseAperioDescription(description);
-          await raf.setPosition(currentPos);
+        if (entry.tag == 256) {
+          width = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 257) {
+          height = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 322) {
+          tileWidth = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 323) {
+          tileHeight = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 270) {
+          description = await _readTiffString(raf, entry.count, entry.valueOffset, inlineMaxBytes: entry.inlineMaxBytes, entryBd: entry.entryBd, offsetInEntry: entry.offsetInEntry);
+          if (description != null) {
+            properties = _parseAperioDescription(description);
+          }
         }
       }
 
       String? imageType;
       if (tileWidth != null && tileHeight != null) {
         imageType = 'level';
-      } else if (description != null && description.contains('AppMag')) {
-        imageType = 'level';
       } else {
         imageType = _determineImageType(description, width, height, tileWidth, tileHeight) ?? 'other_association';
       }
 
-      if (imageType == 'other_association' || imageType == 'level') {
+      if (imageType == 'other_association') {
         if (width > 0 && height > 0) {
           double aspect = width / height;
-          bool canBeThumbnail = (imageType == 'other_association') || (imageType == 'level' && tileWidth == null);
-
-          if (canBeThumbnail && width < 2000 && height < 2000) {
-            if (width == 687 && height == 687) {
-              imageType = 'label';
-            } else if (width <= 1024 && (aspect > 0.5 && aspect < 2.0)) {
+          if (width < 2000 && height < 2000 && (aspect > 0.5 && aspect < 2.0)) {
+            if (!allImages.any((img) => img.type == 'thumbnail')) {
               imageType = 'thumbnail';
             }
-          }
-          if (canBeThumbnail && width >= 1500 && height < 1000 && aspect > 2.0) {
-            imageType = 'macro';
           }
         }
       }
 
       allImages.add(SvsImageInfo(
+        type: imageType,
         width: width,
         height: height,
         tileWidth: tileWidth,
         tileHeight: tileHeight,
         compression: properties['Compression'],
         properties: properties,
-        type: imageType,
       ));
 
-      final nextIfdBytes = await raf.read(4);
-      if (nextIfdBytes.length < 4) break;
-      ifdOffset = ByteData.sublistView(nextIfdBytes).getUint32(0, endian);
+      ifdOffset = await _readNextIfdOffset(raf, header.nextIfdOffsetPos, endian, isBigTiff);
     }
 
-    List<SvsImageInfo> levels = [];
-    Map<String, SvsImageInfo> associations = {};
+    final levels = allImages.where((img) => img.type == 'level').toList();
+    final Map<String, SvsImageInfo> associations = {};
 
     for (var img in allImages) {
-      if (img.type == 'level') {
-        levels.add(img);
-      } else if (img.type != null) {
-        String key = img.type!;
+      if (img.type != 'level') {
+        String key = img.type ?? 'association';
         if (key == 'other_association') {
           key = 'assoc_${allImages.indexOf(img)}';
         } else {
@@ -1133,15 +1331,15 @@ Future<SvsFullMetadata?> readFullSvsMetadata(SvsFile svs) async {
   });
 }
 
-/// Reads basic metadata of the primary image from the SVS file without loading the entire file into memory.
+/// Reads basic metadata of the primary image from the SVS file.
 ///
-/// Uses [RandomAccessFile] for positional reading and [ByteData] for parsing.
 /// [svs] is the open [SvsFile].
 /// Returns an [SvsMetadata] instance, or `null` on failure.
 Future<SvsMetadata?> readSvsMetadata(SvsFile svs) async {
   return await svs.synchronized(() async {
     final raf = svs.raf;
     final endian = svs.endian;
+    final isBigTiff = svs.isBigTiff;
     int ifdOffset = svs.firstIfdOffset;
 
     Map<String, String> properties = {};
@@ -1151,45 +1349,26 @@ Future<SvsMetadata?> readSvsMetadata(SvsFile svs) async {
     int? tileHeight;
 
     if (ifdOffset != 0) {
-      await raf.setPosition(ifdOffset);
-      final numEntriesBytes = await raf.read(2);
-      if (numEntriesBytes.length < 2) return null;
+      final header = await _readIfdHeader(raf, ifdOffset, endian, isBigTiff);
+      if (header == null) return null;
 
-      final numEntries = ByteData.sublistView(numEntriesBytes).getUint16(0, endian);
+      for (var i = 0; i < header.numEntries; i++) {
+        final entry = await _readIfdEntry(raf, endian, isBigTiff);
+        if (entry == null) break;
 
-      for (var i = 0; i < numEntries; i++) {
-        final entryBytes = await raf.read(12);
-        if (entryBytes.length < 12) break;
-        final entryBd = ByteData.sublistView(entryBytes);
-
-        final tag = entryBd.getUint16(0, endian);
-        final type = entryBd.getUint16(2, endian);
-        final count = entryBd.getUint32(4, endian);
-        final valueOffset = entryBd.getUint32(8, endian);
-
-        if (tag == 256) {
-          width = _readTiffValue(type, count, valueOffset, entryBd, 8, endian);
-        }
-        else if (tag == 257) {
-          height = _readTiffValue(type, count, valueOffset, entryBd, 8, endian);
-        }
-        else if (tag == 322) {
-          tileWidth = _readTiffValue(type, count, valueOffset, entryBd, 8, endian);
-        }
-        else if (tag == 323) {
-          tileHeight = _readTiffValue(type, count, valueOffset, entryBd, 8, endian);
-        }
-        else if (tag == 270) {
-          final currentPos = await raf.position();
-          await raf.setPosition(valueOffset);
-          final descBytes = await raf.read(count);
-          var length = descBytes.length;
-          if (length > 0 && descBytes[length - 1] == 0) {
-            length--;
+        if (entry.tag == 256) {
+          width = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 257) {
+          height = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 322) {
+          tileWidth = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 323) {
+          tileHeight = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+        } else if (entry.tag == 270) {
+          final description = await _readTiffString(raf, entry.count, entry.valueOffset, inlineMaxBytes: entry.inlineMaxBytes, entryBd: entry.entryBd, offsetInEntry: entry.offsetInEntry);
+          if (description != null) {
+            properties = _parseAperioDescription(description);
           }
-          final description = String.fromCharCodes(descBytes.sublist(0, length)).trim();
-          properties = _parseAperioDescription(description);
-          await raf.setPosition(currentPos);
         }
       }
     }
@@ -1205,15 +1384,6 @@ Future<SvsMetadata?> readSvsMetadata(SvsFile svs) async {
   });
 }
 
-int _readTiffValue(int type, int count, int valueOffset, ByteData entryBd, int offsetInEntry, Endian endian) {
-  if (type == 3) { // SHORT
-    return entryBd.getUint16(offsetInEntry, endian);
-  } else if (type == 4) { // LONG
-    return entryBd.getUint32(offsetInEntry, endian);
-  }
-  return valueOffset;
-}
-
 Map<String, String> _parseAperioDescription(String description) {
   final Map<String, String> props = {};
   final lines = description.split(RegExp(r'[|\n\r]'));
@@ -1222,16 +1392,14 @@ Map<String, String> _parseAperioDescription(String description) {
     line = line.trim();
     if (line.isEmpty) continue;
 
-    // Extract vendor name and software version
     if (line.startsWith('Aperio ')) {
       props['Vendor'] = 'Aperio';
       props['Version'] = line.substring(7).trim();
       continue;
     }
 
-    // Process line with general image characteristics (e.g. 44704x28257 [0,100 43823x28157] (240x240) JPEG/RGB Q=70)
     if (RegExp(r'^\d+x\d+').hasMatch(line)) {
-      props['ImageInfo'] = line; // Save original string for completeness
+      props['ImageInfo'] = line;
 
       final qMatch = RegExp(r'Q[=:]\s*(\d+)').firstMatch(line);
       if (qMatch != null) {
@@ -1244,11 +1412,13 @@ Map<String, String> _parseAperioDescription(String description) {
         props['Compression'] = '${formatMatch.group(1)} (Q=${props['CompressionQuality']})';
       } else if (qMatch != null) {
         props['Compression'] = 'JPEG (Q=${props['CompressionQuality']})';
+      } else if (line.toUpperCase().contains('J2K') || line.toUpperCase().contains('JPEG2000')) {
+        props['CompressionFormat'] = 'JPEG2000';
+        props['Compression'] = 'JPEG2000';
       }
       continue;
     }
 
-    // Process standard key-value parameters
     final parts = line.split('=');
     if (parts.length >= 2) {
       final key = parts[0].trim();
@@ -1267,6 +1437,10 @@ String? _determineImageType(
   int? tileWidth,
   int? tileHeight,
 ) {
+  if (tileWidth != null && tileHeight != null) {
+    return 'level';
+  }
+
   if (description != null) {
     final descLower = description.toLowerCase();
     if (descLower.contains('label')) {
@@ -1317,6 +1491,50 @@ Uint8List _combineJpegWithTables(Uint8List jpegBytes, Uint8List jpegTables) {
     bb.add(jpegBytes);
   }
   return bb.takeBytes();
+}
+
+img.Image? _decodeJpeg2000(Uint8List bytes) {
+  try {
+    final jpx = JpxImage();
+    jpx.parse(bytes);
+    if (jpx.width <= 0 || jpx.height <= 0 || jpx.tiles.isEmpty) {
+      return null;
+    }
+
+    if (jpx.tiles.length == 1 &&
+        jpx.tiles[0].left == 0 &&
+        jpx.tiles[0].top == 0 &&
+        jpx.tiles[0].width == jpx.width &&
+        jpx.tiles[0].height == jpx.height) {
+      return img.Image.fromBytes(
+        width: jpx.width,
+        height: jpx.height,
+        bytes: jpx.tiles[0].items.buffer,
+        numChannels: 4,
+        order: img.ChannelOrder.rgba,
+      );
+    }
+
+    final image = img.Image(
+      width: jpx.width,
+      height: jpx.height,
+      numChannels: 4,
+    );
+    for (final tile in jpx.tiles) {
+      if (tile.width <= 0 || tile.height <= 0) continue;
+      final tileImg = img.Image.fromBytes(
+        width: tile.width,
+        height: tile.height,
+        bytes: tile.items.buffer,
+        numChannels: 4,
+        order: img.ChannelOrder.rgba,
+      );
+      img.compositeImage(image, tileImg, dstX: tile.left, dstY: tile.top);
+    }
+    return image;
+  } catch (_) {
+    return null;
+  }
 }
 
 Uint8List _decompressTiffLzw(Uint8List input, int expectedLength) {

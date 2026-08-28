@@ -2,7 +2,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:path_provider/path_provider.dart';
-import 'package:omnigisto_pkg/metadata_read.dart';
+import 'package:omnigisto_pkg/omnigisto_pkg.dart';
 import 'package:image/image.dart' as img;
 import 'dart:typed_data';
 
@@ -203,10 +203,6 @@ class _TestScreenState extends State<TestScreen> {
                   return Image.memory(element!);
                 }),
               ],)
-
-
-
-
           ]
         ),
       ),

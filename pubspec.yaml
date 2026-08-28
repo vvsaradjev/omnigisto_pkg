@@ -1,6 +1,6 @@
 name: omnigisto_pkg
-description: "A lightweight, fast, and memory-efficient Flutter/Dart library for reading Aperio SVS image metadata, extracting tiles, and associated images."
-version: 0.0.2-alfa.1
+description: "A lightweight, fast, and memory-efficient Flutter/Dart library for reading Aperio SVS histological image metadata, extracting tiles, and associated images."
+version: 0.1.0-beta
 homepage: https://github.com/vvsaradjev/omnigisto_pkg
 repository: https://github.com/vvsaradjev/omnigisto_pkg
 issue_tracker: https://github.com/vvsaradjev/omnigisto_pkg/issues
@@ -14,6 +14,7 @@ dependencies:
   flutter:
     sdk: flutter
   image: ^4.9.2
+  jpeg2000: ^0.1.3
 
 dev_dependencies:
   flutter_test:

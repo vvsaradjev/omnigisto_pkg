@@ -105,6 +105,9 @@ class SvsFile {
   /// Byte offset to the first Image File Directory (IFD).
   final int firstIfdOffset;
 
+  /// Whether the file is in BigTIFF format (64-bit offsets, magic 43).
+  final bool isBigTiff;
+
   /// Internal synchronization lock to serialize access to [raf] across concurrent operations.
   Future<void>? _lastOp;
 
@@ -115,7 +118,7 @@ class SvsFile {
   Uint8List? cachedGlobalJpegTables;
 
   /// Creates an [SvsFile] instance.
-  SvsFile(this.raf, this.endian, this.firstIfdOffset);
+  SvsFile(this.raf, this.endian, this.firstIfdOffset, [this.isBigTiff = false]);
 
   /// Executes [action] sequentially to guarantee concurrency-safe access to [raf].
   Future<T> synchronized<T>(Future<T> Function() action) {

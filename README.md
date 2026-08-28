@@ -7,10 +7,12 @@ A lightweight, fast, and memory-efficient Dart & Flutter library for reading Ape
 ## Features
 
 - **Memory-Efficient & Fast**: Uses `RandomAccessFile` and `ByteData` to stream and read TIFF/SVS headers and tile offsets positionally without loading the entire multi-gigabyte image into memory.
+- **BigTIFF Support**: Full support for BigTIFF (Magic 43 / 64-bit offsets, `LONG8`, `IFD8`), enabling seamless reading of massive slide files (> 4 GB, up to tens of gigabytes).
+- **Extensive Compression Support**: Decodes JPEG (with JPEGTables & Adobe APP14 color handling), JPEG 2000 (Aperio compression tags 33003, 33005, 34712), LZW (with horizontal predictor), Deflate, and uncompressed RGB/Grayscale.
 - **Full Pyramid Inspection**: Retrieve dimensions, tile configurations, compression formats, and resolution levels for the whole slide pyramid.
 - **On-Demand Tile Extraction**: Extract specific image tiles by level and tile grid coordinates (`tileX`, `tileY`) in different formats.
 - **Associated Images**: Extract non-tiled associated images such as `thumbnail`, `label` (slide barcode/label), and `macro` (full slide preview) in different formats.
-- **Aperio Metadata Parser**: Automatically parses Aperio header properties, compression quality (`Q`), microns-per-pixel (`MPPS`), scan dimensions, and custom key-value pairs.
+- **Aperio Metadata Parser**: Automatically parses Aperio header properties, compression quality (`Q`), microns-per-pixel (`MPP`), scan dimensions, and custom key-value pairs.
 - **Cross-Platform**: Works across all platforms supported by Dart `dart:io` (Flutter for Android, iOS, macOS, Windows, Linux).
 
 ---
@@ -38,19 +40,19 @@ dart pub get
 ### 2. Import package
 
 ```dart
-import 'package:omnigisto_pkg/metadata_read.dart';
+import 'package:omnigisto_pkg/omnigisto_pkg.dart';
 ```
 
 ---
 
 ## Usage
 
-### 1. Opening an SVS File
+### 1. Opening an SVS / BigTIFF File
 
 Open the SVS file handle using `openSvsFile`. Always close the handle when finished (or use a `try`/`finally` block).
 
 ```dart
-import 'package:omnigisto_pkg/metadata_read.dart';
+import 'package:omnigisto_pkg/omnigisto_pkg.dart';
 
 void main() async {
   final svs = await openSvsFile('/path/to/slide.svs');
@@ -60,6 +62,7 @@ void main() async {
   }
 
   try {
+    print('Opened slide. BigTIFF: ${svs.isBigTiff}');
     // Perform operations...
   } finally {
     await svs.close();
@@ -110,7 +113,7 @@ if (fullMeta != null) {
 
 ### 4. Extracting Associated Images (Thumbnail, Label, Macro)
 
-Extract img.Image to display  them directly in Flutter UI:
+Extract `img.Image` to display them directly in Flutter UI:
 
 ```dart
 import 'dart:typed_data';
@@ -126,59 +129,54 @@ final img.Image? macro = await extractSvsImageAsImage(svs, 'macro');
 Widget buildImage(img.Image? pic) {
   if (pic == null) return const Text('Image not available');
   
-  final Uint8List? tmp = Uint8List.fromList(img.encodeJpg(pic));
+  final Uint8List tmp = Uint8List.fromList(img.encodeJpg(pic));
   return Image.memory(tmp);
 }
 ```
 
-Extract raw bytes for associated images as in svs file, it's fast, but can't be used directly in flutter UI
+Extract raw bytes for associated images:
 ```dart
 import 'dart:typed_data';
-import 'package:flutter/material.dart';
 
-// Extract thumbnail, label, or macro
+// Extract thumbnail, label, or macro as raw bytes
 final Uint8List? thumbBytes = await extractSvsImage(svs, 'thumbnail');
 final Uint8List? labelBytes = await extractSvsImage(svs, 'label');
 final Uint8List? macroBytes = await extractSvsImage(svs, 'macro');
-
 ```
-
-
 
 ---
 
 ### 5. Extracting Individual Tiles
 
-Extract specific tiles on demand to display  them directly in Flutter UI for viewport rendering or deep-zoom viewers
+Extract specific tiles on demand as decoded `img.Image` (supports JPEG, JPEG 2000, LZW, Deflate, Raw RGB):
 
 ```dart
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:image/image.dart' as img;
+
 final fullMeta = await readFullSvsMetadata(svs);
 if (fullMeta != null && fullMeta.levels.isNotEmpty) {
-    const int levelIndex = 0; // 0 = highest resolution baseline
-    final level = fullMeta.levels[levelIndex];
-    
-    int totalCols = (level.width + level.tileWidth! - 1) ~/ level.tileWidth!;
-    int totalRows = (level.height + level.tileHeight! - 1) ~/ level.tileHeight!;
-    
-    print('Grid size: $totalCols columns x $totalRows rows');
-    
-    // Extract tile at coordinate (tileX: 0, tileY: 0)
-    final img.Image? tile = await extractSvsTileAsImage(svs, levelIndex, 0, 0);
-    
-    Uint8List? tileBytes =  Uint8List.fromList(img.encodeJpg(tile));
+  const int levelIndex = 0; // 0 = highest resolution baseline
+  final level = fullMeta.levels[levelIndex];
   
+  int totalCols = (level.width + level.tileWidth! - 1) ~/ level.tileWidth!;
+  int totalRows = (level.height + level.tileHeight! - 1) ~/ level.tileHeight!;
+  
+  print('Grid size: $totalCols columns x $totalRows rows');
+  
+  // Extract tile at coordinate (tileX: 0, tileY: 0)
+  final img.Image? tile = await extractSvsTileAsImage(svs, levelIndex, 0, 0);
+  if (tile != null) {
+    Uint8List tileBytes = Uint8List.fromList(img.encodeJpg(tile));
+    // Display or process tile...
+  }
 }
-
-
 ```
 
-Extract specific tiles as is:
+Extract specific tiles as raw bytes:
 ```dart
 import 'dart:typed_data';
-import 'package:flutter/material.dart';
 
 final fullMeta = await readFullSvsMetadata(svs);
 if (fullMeta != null && fullMeta.levels.isNotEmpty) {
@@ -191,19 +189,14 @@ if (fullMeta != null && fullMeta.levels.isNotEmpty) {
 
     print('Grid size: $totalCols columns x $totalRows rows');
 
-    // Extract tile at coordinate (tileX: 0, tileY: 0)
+    // Extract raw tile bytes at coordinate (tileX: 0, tileY: 0)
     final Uint8List? tileBytes = await extractSvsTile(svs, levelIndex, 0, 0);
     if (tileBytes != null) {
       print('Extracted tile (${tileBytes.length} bytes)');
     }
   }
 }
-
-
 ```
-
-
-
 
 ---
 
@@ -211,24 +204,22 @@ if (fullMeta != null && fullMeta.levels.isNotEmpty) {
 
 ### Functions
 
-| Function                                                                                                                                   | Description                                                           |
-|:-------------------------------------------------------------------------------------------------------------------------------------------|:----------------------------------------------------------------------|
-| `Future<SvsFile?> openSvsFile(String path)`                                                                                                | Opens an SVS file and parses the TIFF header.                         |
-| `Future<SvsMetadata?> readSvsMetadata(SvsFile svs)`                                                                                        | Reads basic metadata of the primary image.                            |
-| `Future<SvsFullMetadata?> readFullSvsMetadata(SvsFile svs)`                                                                                | Reads all pyramid levels and associated image metadata.               |
-| `Future<img.Image?> extractSvsImageAsImage(SvsFile svs, String type)`                                                                      | Extracts Image for `'thumbnail'`, `'label'`, or `'macro'`.            |
-| `Future<Uint8List?> extractSvsImageAsJpeg(SvsFile svs, String type, { int quality = 90 })`                                                 | Extracts JPEG raw bytes for `'thumbnail'`, `'label'`, or `'macro'`    |
-| `Future<Uint8List?> extractSvsImage(SvsFile svs, String type)`                                                                             | Extracts raw bytes for `'thumbnail'`, `'label'`, or `'macro'`.        |
-| `Future<Uint8List?> extractSvsImage(SvsFile svs, String type)`                                                                             | Extracts raw bytes for `'thumbnail'`, `'label'`, or `'macro'`.        |
-| `Future<img.Image?> extractSvsTileAsImage(SvsFile svs, int layerIndex, int tileX,int tileY`                                                | Extracts Image for a specific tile at the given grid coordinates.     |
-| `Future<Uint8List?> extractSvsTile(SvsFile svs, int layerIndex, int tileX, int tileY)`                                                     | Extracts raw bytes for a specific tile at the given grid coordinates. |
-
+| Function | Description |
+| :--- | :--- |
+| `Future<SvsFile?> openSvsFile(String path)` | Opens an SVS/BigTIFF file and parses the TIFF header. |
+| `Future<SvsMetadata?> readSvsMetadata(SvsFile svs)` | Reads basic metadata of the primary image. |
+| `Future<SvsFullMetadata?> readFullSvsMetadata(SvsFile svs)` | Reads all pyramid levels and associated image metadata. |
+| `Future<img.Image?> extractSvsImageAsImage(SvsFile svs, String type, {bool applyColorScheme = true})` | Extracts decoded `img.Image` for `'thumbnail'`, `'label'`, or `'macro'`. |
+| `Future<Uint8List?> extractSvsImageAsJpeg(SvsFile svs, String type, {int quality = 90, bool applyColorScheme = true})` | Extracts JPEG encoded byte data for `'thumbnail'`, `'label'`, or `'macro'`. |
+| `Future<Uint8List?> extractSvsImage(SvsFile svs, String type)` | Extracts raw bytes for `'thumbnail'`, `'label'`, or `'macro'`. |
+| `Future<img.Image?> extractSvsTileAsImage(SvsFile svs, int layerIndex, int tileX, int tileY, {bool applyColorScheme = true})` | Extracts and decodes `img.Image` for a specific tile. |
+| `Future<Uint8List?> extractSvsTile(SvsFile svs, int layerIndex, int tileX, int tileY)` | Extracts raw bytes for a specific tile. |
 
 ### Classes
 
 | Class | Description |
 | :--- | :--- |
-| `SvsFile` | Encapsulates the `RandomAccessFile`, endianness, and first IFD offset. Call `close()` when done. |
+| `SvsFile` | Encapsulates the `RandomAccessFile`, endianness, `isBigTiff` flag, and first IFD offset. Call `close()` when done. |
 | `SvsMetadata` | Contains `width`, `height`, `tileWidth`, `tileHeight`, `compression`, and `properties` map for the primary image. |
 | `SvsFullMetadata` | Contains `levels` (`List<SvsImageInfo>`) and `associations` (`Map<String, SvsImageInfo>`). |
 | `SvsImageInfo` | Detailed metadata for a single layer or associated image (`width`, `height`, `tileWidth`, `tileHeight`, `compression`, `properties`, `type`). |
