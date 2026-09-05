@@ -19,5 +19,12 @@
 * Added main library export `package:omnigisto_pkg/omnigisto_pkg.dart`
 * Added comprehensive test suite for BigTIFF and JPEG 2000 parsing and extraction
 * Extra tests on iOs and Android
-* Bag fixes
+* Bug fixes
+
+## 0.1.1
+* First release
+* Fixed SubIFD (tag 330) handling in `readFullSvsMetadata` for consistent pyramid level count with `extractSvsTile`
+* Improved associated image detection (`label`, `macro`, `thumbnail`) in `_determineImageType`
+* Removed hardcoded resolution check (687x687) for label images to support various Aperio scanner models (AT2, GT450, CS2, etc.)
+* Added aspect ratio and keyword-based heuristics for slide labels, macro overviews, and thumbnails
 

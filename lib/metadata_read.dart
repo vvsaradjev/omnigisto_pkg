@@ -1256,6 +1256,7 @@ Future<SvsFullMetadata?> readFullSvsMetadata(SvsFile svs) async {
       int? tileHeight;
       Map<String, String> properties = {};
       String? description;
+      List<int> subIfdOffsets = [];
 
       for (var i = 0; i < header.numEntries; i++) {
         final entry = await _readIfdEntry(raf, endian, isBigTiff);
@@ -1274,6 +1275,8 @@ Future<SvsFullMetadata?> readFullSvsMetadata(SvsFile svs) async {
           if (description != null) {
             properties = _parseAperioDescription(description);
           }
+        } else if (entry.tag == 330) {
+          subIfdOffsets = await _readTiffArray(raf, entry.dataType, entry.count, entry.valueOffset, endian, inlineMaxBytes: entry.inlineMaxBytes, entryBd: entry.entryBd, offsetInEntry: entry.offsetInEntry);
         }
       }
 
@@ -1304,6 +1307,69 @@ Future<SvsFullMetadata?> readFullSvsMetadata(SvsFile svs) async {
         compression: properties['Compression'],
         properties: properties,
       ));
+
+      // Process SubIFDs if present
+      for (final subIfd in subIfdOffsets) {
+        if (subIfd != 0) {
+          final subHeader = await _readIfdHeader(raf, subIfd, endian, isBigTiff);
+          if (subHeader != null) {
+            int sWidth = 0;
+            int sHeight = 0;
+            int? sTileWidth;
+            int? sTileHeight;
+            Map<String, String> sProperties = {};
+            String? sDescription;
+
+            for (var i = 0; i < subHeader.numEntries; i++) {
+              final entry = await _readIfdEntry(raf, endian, isBigTiff);
+              if (entry == null) break;
+
+              if (entry.tag == 256) {
+                sWidth = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+              } else if (entry.tag == 257) {
+                sHeight = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+              } else if (entry.tag == 322) {
+                sTileWidth = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+              } else if (entry.tag == 323) {
+                sTileHeight = _readTiffValue(entry.dataType, entry.count, entry.valueOffset, entry.entryBd, entry.offsetInEntry, endian);
+              } else if (entry.tag == 270) {
+                sDescription = await _readTiffString(raf, entry.count, entry.valueOffset, inlineMaxBytes: entry.inlineMaxBytes, entryBd: entry.entryBd, offsetInEntry: entry.offsetInEntry);
+                if (sDescription != null) {
+                  sProperties = _parseAperioDescription(sDescription);
+                }
+              }
+            }
+
+            String? sImageType;
+            if (sTileWidth != null && sTileHeight != null) {
+              sImageType = 'level';
+            } else {
+              sImageType = _determineImageType(sDescription, sWidth, sHeight, sTileWidth, sTileHeight) ?? 'other_association';
+            }
+
+            if (sImageType == 'other_association') {
+              if (sWidth > 0 && sHeight > 0) {
+                double aspect = sWidth / sHeight;
+                if (sWidth < 2000 && sHeight < 2000 && (aspect > 0.5 && aspect < 2.0)) {
+                  if (!allImages.any((img) => img.type == 'thumbnail')) {
+                    sImageType = 'thumbnail';
+                  }
+                }
+              }
+            }
+
+            allImages.add(SvsImageInfo(
+              type: sImageType,
+              width: sWidth,
+              height: sHeight,
+              tileWidth: sTileWidth,
+              tileHeight: sTileHeight,
+              compression: sProperties['Compression'] ?? properties['Compression'],
+              properties: sProperties.isNotEmpty ? sProperties : properties,
+            ));
+          }
+        }
+      }
 
       ifdOffset = await _readNextIfdOffset(raf, header.nextIfdOffsetPos, endian, isBigTiff);
     }
@@ -1443,26 +1509,35 @@ String? _determineImageType(
 
   if (description != null) {
     final descLower = description.toLowerCase();
-    if (descLower.contains('label')) {
+    if (descLower.contains('label') || descLower.contains('barcode')) {
       return 'label';
-    } else if (descLower.contains('macro')) {
+    } else if (descLower.contains('macro') || descLower.contains('overview')) {
       return 'macro';
-    } else if (descLower.contains('thumbnail')) {
+    } else if (descLower.contains('thumbnail') ||
+        descLower.contains('thumb') ||
+        descLower.contains('->')) {
       return 'thumbnail';
     }
   }
 
   if (tileWidth == null && tileHeight == null && width > 0 && height > 0) {
-    double aspect = width / height;
-    if (width < 2000 && height < 2000) {
-      if (width == 687 && height == 687) {
-        return 'label';
-      } else if (width <= 1024 && (aspect > 0.5 && aspect < 2.0)) {
-        return 'thumbnail';
-      }
-    }
-    if (width >= 1500 && height < 1000 && aspect > 2.0) {
+    final double aspect = width / height;
+
+    // Macro image: whole slide overview, typically wide aspect ratio (or tall if vertical)
+    if (aspect >= 1.8 || aspect <= 0.55 || (aspect >= 1.5 && width >= 1200)) {
       return 'macro';
+    }
+
+    // Label image: square or near-square slide label / barcode
+    // Aperio scanners (ScanScope CS, CS2, AT2, GT450, etc.) use square or near-square
+    // label resolutions (e.g. 400x400, 500x500, 687x687, 1000x1000, etc.)
+    if (aspect >= 0.75 && aspect <= 1.33) {
+      return 'label';
+    }
+
+    // Thumbnail image: downsampled preview of the scanned area
+    if (width <= 1024 && height <= 1024) {
+      return 'thumbnail';
     }
   }
 
