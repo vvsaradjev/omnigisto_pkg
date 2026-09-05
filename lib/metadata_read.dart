@@ -2,7 +2,6 @@
 // Copyright (c) 2026, Vladislav Saradzev
 // Vanadzor
 // All rights reserved.
-// Beta version use on you own risk )
 
 import 'dart:io';
 import 'dart:typed_data';

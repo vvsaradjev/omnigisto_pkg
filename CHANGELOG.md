@@ -28,3 +28,6 @@
 * Removed hardcoded resolution check (687x687) for label images to support various Aperio scanner models (AT2, GT450, CS2, etc.)
 * Added aspect ratio and keyword-based heuristics for slide labels, macro overviews, and thumbnails
 
+## 0.1.2
+* Some packages updated
+
