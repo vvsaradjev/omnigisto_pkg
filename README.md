@@ -220,6 +220,30 @@ final Uint8List? macroBytes = await extractSvsImage(svs, 'macro');
 
 ### 5. Extracting Individual Tiles
 
+Extract specific tiles as raw bytes (recommended for production) :
+```dart
+import 'dart:typed_data';
+
+final fullMeta = await readFullSvsMetadata(svs);
+if (fullMeta != null && fullMeta.levels.isNotEmpty) {
+  const int levelIndex = 0; // 0 = highest resolution baseline
+  final level = fullMeta.levels[levelIndex];
+
+  if (level.tileWidth != null && level.tileHeight != null) {
+    int totalCols = (level.width + level.tileWidth! - 1) ~/ level.tileWidth!;
+    int totalRows = (level.height + level.tileHeight! - 1) ~/ level.tileHeight!;
+
+    print('Grid size: $totalCols columns x $totalRows rows');
+
+    // Extract raw tile bytes at coordinate (tileX: 0, tileY: 0)
+    final Uint8List? tileBytes = await extractSvsTile(svs, levelIndex, 0, 0);
+    if (tileBytes != null) {
+      print('Extracted tile (${tileBytes.length} bytes)');
+    }
+  }
+}
+```
+
 Extract specific tiles on demand as decoded `img.Image` (supports JPEG, JPEG 2000, LZW, Deflate, Raw RGB, with optional `DisplayColor` and color scheme adjustments):
 
 ```dart
@@ -253,29 +277,35 @@ if (fullMeta != null && fullMeta.levels.isNotEmpty) {
 }
 ```
 
-Extract specific tiles as raw bytes:
+Extract tiles with cancellation support (`CancellationToken`):
+
 ```dart
 import 'dart:typed_data';
+import 'package:omnigisto_pkg/omnigisto_pkg.dart';
 
-final fullMeta = await readFullSvsMetadata(svs);
-if (fullMeta != null && fullMeta.levels.isNotEmpty) {
-  const int levelIndex = 0; // 0 = highest resolution baseline
-  final level = fullMeta.levels[levelIndex];
+final cancelToken = CancellationToken();
 
-  if (level.tileWidth != null && level.tileHeight != null) {
-    int totalCols = (level.width + level.tileWidth! - 1) ~/ level.tileWidth!;
-    int totalRows = (level.height + level.tileHeight! - 1) ~/ level.tileHeight!;
+// Start extracting a tile with the cancellation token
+final Future<Uint8List?> tileFuture = extractSvsTile(
+  svs,
+  0, // levelIndex
+  0, // tileX
+  0, // tileY
+  cancelToken: cancelToken,
+);
 
-    print('Grid size: $totalCols columns x $totalRows rows');
+// If the user scrolls, zooms away, or disposes the widget:
+cancelToken.cancel();
 
-    // Extract raw tile bytes at coordinate (tileX: 0, tileY: 0)
-    final Uint8List? tileBytes = await extractSvsTile(svs, levelIndex, 0, 0);
-    if (tileBytes != null) {
-      print('Extracted tile (${tileBytes.length} bytes)');
-    }
-  }
+final Uint8List? tileBytes = await tileFuture;
+if (tileBytes != null) {
+  print('Tile loaded: ${tileBytes.length} bytes');
+} else {
+  print('Tile loading was cancelled or failed.');
 }
 ```
+
+
 
 ---
 
