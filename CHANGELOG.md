@@ -31,7 +31,7 @@
 ## 0.1.2
 * Some packages updated
 
-## 0.1.3
+## 0.1.4
 * Added `DisplayColor` support: automatic extraction and parsing of Aperio `DisplayColor` parameter in `SvsMetadata` and `SvsImageInfo`.
 * Added pixel tinting and color mapping according to `DisplayColor` in tile and associated image extraction pipelines.
 * Added `applyDisplayColor` and optional `displayColor` override parameters to `extractSvsTileAsImage`, `extractSvsImageAsImage`, and `extractSvsImageAsJpeg`.
