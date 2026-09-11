@@ -12,8 +12,12 @@ import 'package:omnigisto_pkg/types/types.dart';
 /// Opens an SVS file at the specified [path] and reads its TIFF/BigTIFF header.
 ///
 /// Supports both standard TIFF (Magic 42) and BigTIFF (Magic 43, 64-bit offsets).
+/// [maxConcurrency] defines the maximum number of concurrent file handles in the pool
+/// used for parallel tile reading (default is 4). For slow mechanical HDDs or resource-constrained
+/// environments, set to 1 or 2 to avoid seek thrashing. For fast SSDs/NVMe, higher values
+/// (e.g. 4 to 8) maximize read throughput.
 /// Returns an [SvsFile] instance if the file is a valid SVS/TIFF file, or `null` if opening or validation fails.
-Future<SvsFile?> openSvsFile(String path) async {
+Future<SvsFile?> openSvsFile(String path, {int maxConcurrency = 4}) async {
   final file = File(path);
   if (!await file.exists()) return null;
 
@@ -41,7 +45,7 @@ Future<SvsFile?> openSvsFile(String path) async {
     if (magic == 42) {
       // Standard TIFF (32-bit offsets)
       final ifdOffset = bd.getUint32(4, endian);
-      return SvsFile(raf, endian, ifdOffset, false);
+      return SvsFile(raf, endian, ifdOffset, false, path, maxConcurrency);
     } else if (magic == 43) {
       // BigTIFF (64-bit offsets)
       if (headerBytes.length < 16) {
@@ -55,7 +59,7 @@ Future<SvsFile?> openSvsFile(String path) async {
         return null;
       }
       final ifdOffset = bd.getUint64(8, endian);
-      return SvsFile(raf, endian, ifdOffset, true);
+      return SvsFile(raf, endian, ifdOffset, true, path, maxConcurrency);
     } else {
       await raf.close();
       return null;
@@ -146,11 +150,15 @@ Future<Uint8List?> extractSvsImage(SvsFile svs, String type) async {
 /// [applyColorScheme] if `true`, applies the appropriate color scheme interpretation
 /// (e.g., treating RGB JPEG strips as RGB instead of default YCbCr, WhiteIsZero inversion, palette mapping).
 /// If `false` extracts the image as-is (backward compatible).
+/// [applyDisplayColor] if `true`, applies the DisplayColor color tinting/mapping if present in metadata or passed explicitly.
+/// [displayColor] optional explicit display color override (e.g., 0xRRGGBB).
 /// Returns the decoded [img.Image], or `null` if the requested image type was not found or failed to decode.
 Future<img.Image?> extractSvsImageAsImage(
   SvsFile svs,
   String type, {
   bool applyColorScheme = true,
+  bool applyDisplayColor = true,
+  int? displayColor,
 }) async {
   return await svs.synchronized(() async {
     final raf = svs.raf;
@@ -236,6 +244,13 @@ Future<img.Image?> extractSvsImageAsImage(
           return null;
         }
 
+        int? ifdDisplayColor;
+        if (description != null) {
+          final props = _parseAperioDescription(description);
+          ifdDisplayColor = parseDisplayColor(props['DisplayColor']);
+        }
+        final effectiveDisplayColor = displayColor ?? ifdDisplayColor;
+
         try {
           if (compression == 7 || compression == 6) {
             final fullImage = img.Image(width: width, height: height, numChannels: 3);
@@ -280,6 +295,9 @@ Future<img.Image?> extractSvsImageAsImage(
                 fullImage.iccProfile = img.IccProfile('', img.IccProfileCompression.none, iccProfile);
               }
             }
+            if (applyDisplayColor && effectiveDisplayColor != null && effectiveDisplayColor != 0) {
+              return _applyDisplayColorToImage(fullImage, effectiveDisplayColor);
+            }
             return fullImage;
           } else if (compression == 33003 || compression == 33005 || compression == 34712) {
             final fullImage = img.Image(width: width, height: height, numChannels: 4);
@@ -299,6 +317,9 @@ Future<img.Image?> extractSvsImageAsImage(
               if (iccProfile != null && iccProfile.length <= 65519) {
                 fullImage.iccProfile = img.IccProfile('', img.IccProfileCompression.none, iccProfile);
               }
+            }
+            if (applyDisplayColor && effectiveDisplayColor != null && effectiveDisplayColor != 0) {
+              return _applyDisplayColorToImage(fullImage, effectiveDisplayColor);
             }
             return fullImage;
           } else if (compression == 5) {
@@ -329,7 +350,7 @@ Future<img.Image?> extractSvsImageAsImage(
               offset += stripExpectedBytes;
             }
 
-            var image = img.Image.fromBytes(
+            img.Image? image = img.Image.fromBytes(
               width: width,
               height: height,
               bytes: uncompressedAll.buffer,
@@ -343,7 +364,10 @@ Future<img.Image?> extractSvsImageAsImage(
                 samplesPerPixel,
                 colorMap,
                 iccProfile,
+                displayColor: (applyDisplayColor ? effectiveDisplayColor : null),
               );
+            } else if (applyDisplayColor && effectiveDisplayColor != null && effectiveDisplayColor != 0) {
+              image = _applyDisplayColorToImage(image, effectiveDisplayColor);
             }
             return image;
           } else if (compression == 1) {
@@ -357,7 +381,7 @@ Future<img.Image?> extractSvsImageAsImage(
             if (predictor == 2) {
               _applyHorizontalPredictor(rawBytes, width, height, samplesPerPixel);
             }
-            var image = img.Image.fromBytes(
+            img.Image? image = img.Image.fromBytes(
               width: width,
               height: height,
               bytes: rawBytes.buffer,
@@ -371,7 +395,10 @@ Future<img.Image?> extractSvsImageAsImage(
                 samplesPerPixel,
                 colorMap,
                 iccProfile,
+                displayColor: (applyDisplayColor ? effectiveDisplayColor : null),
               );
+            } else if (applyDisplayColor && effectiveDisplayColor != null && effectiveDisplayColor != 0) {
+              image = _applyDisplayColorToImage(image, effectiveDisplayColor);
             }
             return image;
           } else if (compression == 8 || compression == 32946) {
@@ -402,7 +429,7 @@ Future<img.Image?> extractSvsImageAsImage(
               offset += stripExpectedBytes;
             }
 
-            var image = img.Image.fromBytes(
+            img.Image? image = img.Image.fromBytes(
               width: width,
               height: height,
               bytes: uncompressedAll.buffer,
@@ -416,7 +443,10 @@ Future<img.Image?> extractSvsImageAsImage(
                 samplesPerPixel,
                 colorMap,
                 iccProfile,
+                displayColor: (applyDisplayColor ? effectiveDisplayColor : null),
               );
+            } else if (applyDisplayColor && effectiveDisplayColor != null && effectiveDisplayColor != 0) {
+              image = _applyDisplayColorToImage(image, effectiveDisplayColor);
             }
             return image;
           } else {
@@ -429,14 +459,19 @@ Future<img.Image?> extractSvsImageAsImage(
             final rawBytes = bb.takeBytes();
             var image = img.decodeImage(rawBytes);
             image ??= _decodeJpeg2000(rawBytes);
-            if (image != null && applyColorScheme) {
-              image = _applyColorSchemeToImage(
-                image,
-                photometricInterpretation,
-                samplesPerPixel,
-                colorMap,
-                iccProfile,
-              );
+            if (image != null) {
+              if (applyColorScheme) {
+                image = _applyColorSchemeToImage(
+                  image,
+                  photometricInterpretation,
+                  samplesPerPixel,
+                  colorMap,
+                  iccProfile,
+                  displayColor: (applyDisplayColor ? effectiveDisplayColor : null),
+                );
+              } else if (applyDisplayColor && effectiveDisplayColor != null && effectiveDisplayColor != 0) {
+                image = _applyDisplayColorToImage(image, effectiveDisplayColor);
+              }
             }
             return image;
           }
@@ -461,17 +496,23 @@ Future<img.Image?> extractSvsImageAsImage(
 /// [type] is the image type identifier to extract ('thumbnail', 'label', or 'macro').
 /// [quality] is the JPEG encoding quality (1 to 100, default is 90).
 /// [applyColorScheme] if `true`, applies the appropriate color scheme interpretation.
+/// [applyDisplayColor] if `true`, applies the DisplayColor color tinting/mapping if present in metadata or passed explicitly.
+/// [displayColor] optional explicit display color override (e.g., 0xRRGGBB).
 /// Returns the JPEG encoded byte data, or `null` if the requested image type was not found or failed to decode.
 Future<Uint8List?> extractSvsImageAsJpeg(
   SvsFile svs,
   String type, {
   int quality = 90,
   bool applyColorScheme = true,
+  bool applyDisplayColor = true,
+  int? displayColor,
 }) async {
   final image = await extractSvsImageAsImage(
     svs,
     type,
     applyColorScheme: applyColorScheme,
+    applyDisplayColor: applyDisplayColor,
+    displayColor: displayColor,
   );
   if (image == null) return null;
   return Uint8List.fromList(img.encodeJpg(image, quality: quality));
@@ -507,6 +548,7 @@ class _TiledLevelFullData {
   final Uint8List? jpegTables;
   final Uint8List? iccProfile;
   final List<int>? colorMap;
+  final int? displayColor;
 
   _TiledLevelFullData({
     required this.compression,
@@ -518,10 +560,11 @@ class _TiledLevelFullData {
     this.jpegTables,
     this.iccProfile,
     this.colorMap,
+    this.displayColor,
   });
 }
 
-Future<({List<_TiledLevelInfo> levels, Uint8List? globalJpegTables})> _collectTiledLevels(SvsFile svs) async {
+Future<({List<_TiledLevelInfo> levels, Uint8List? globalJpegTables, int? globalDisplayColor})> _collectTiledLevels(SvsFile svs) async {
   final raf = svs.raf;
   final endian = svs.endian;
   final isBigTiff = svs.isBigTiff;
@@ -529,6 +572,7 @@ Future<({List<_TiledLevelInfo> levels, Uint8List? globalJpegTables})> _collectTi
 
   List<_TiledLevelInfo> levels = [];
   Uint8List? globalJpegTables;
+  int? globalDisplayColor;
 
   while (ifdOffset != 0) {
     final header = await _readIfdHeader(raf, ifdOffset, endian, isBigTiff);
@@ -559,6 +603,12 @@ Future<({List<_TiledLevelInfo> levels, Uint8List? globalJpegTables})> _collectTi
         await raf.setPosition(entry.valueOffset);
         globalJpegTables = await raf.read(entry.count);
         await raf.setPosition(currentPos);
+      } else if (entry.tag == 270 && globalDisplayColor == null) {
+        final description = await _readTiffString(raf, entry.count, entry.valueOffset, inlineMaxBytes: entry.inlineMaxBytes, entryBd: entry.entryBd, offsetInEntry: entry.offsetInEntry);
+        if (description != null) {
+          final props = _parseAperioDescription(description);
+          globalDisplayColor = parseDisplayColor(props['DisplayColor']);
+        }
       }
     }
 
@@ -611,14 +661,18 @@ Future<({List<_TiledLevelInfo> levels, Uint8List? globalJpegTables})> _collectTi
   }
 
   levels.sort((a, b) => b.width.compareTo(a.width));
-  return (levels: levels, globalJpegTables: globalJpegTables);
+  svs.cachedTiledLevels = levels;
+  svs.cachedGlobalJpegTables = globalJpegTables;
+  svs.cachedGlobalDisplayColor = globalDisplayColor;
+  return (levels: levels, globalJpegTables: globalJpegTables, globalDisplayColor: globalDisplayColor);
 }
 
-Future<({List<_TiledLevelInfo> levels, Uint8List? globalJpegTables})> _getOrCollectTiledLevels(SvsFile svs) async {
+Future<({List<_TiledLevelInfo> levels, Uint8List? globalJpegTables, int? globalDisplayColor})> _getOrCollectTiledLevels(SvsFile svs) async {
   if (svs.cachedTiledLevels != null) {
     return (
       levels: svs.cachedTiledLevels! as List<_TiledLevelInfo>,
       globalJpegTables: svs.cachedGlobalJpegTables,
+      globalDisplayColor: svs.cachedGlobalDisplayColor,
     );
   }
 
@@ -627,12 +681,14 @@ Future<({List<_TiledLevelInfo> levels, Uint8List? globalJpegTables})> _getOrColl
       return (
         levels: svs.cachedTiledLevels! as List<_TiledLevelInfo>,
         globalJpegTables: svs.cachedGlobalJpegTables,
+        globalDisplayColor: svs.cachedGlobalDisplayColor,
       );
     }
 
     final collected = await _collectTiledLevels(svs);
     svs.cachedTiledLevels = collected.levels;
     svs.cachedGlobalJpegTables = collected.globalJpegTables;
+    svs.cachedGlobalDisplayColor = collected.globalDisplayColor;
     return collected;
   });
 }
@@ -640,8 +696,9 @@ Future<({List<_TiledLevelInfo> levels, Uint8List? globalJpegTables})> _getOrColl
 Future<_TiledLevelFullData?> _getOrLoadLevelFullData(
   SvsFile svs,
   _TiledLevelInfo targetLevel,
-  Uint8List? globalJpegTables,
-) async {
+  Uint8List? globalJpegTables, [
+  int? globalDisplayColor,
+]) async {
   if (targetLevel.fullData != null) {
     return targetLevel.fullData;
   }
@@ -668,6 +725,7 @@ Future<_TiledLevelFullData?> _getOrLoadLevelFullData(
     Uint8List? jpegTables = globalJpegTables;
     Uint8List? iccProfile;
     List<int>? colorMap;
+    int? displayColor;
 
     for (var i = 0; i < header.numEntries; i++) {
       final entry = await _readIfdEntry(raf, endian, isBigTiff);
@@ -697,6 +755,12 @@ Future<_TiledLevelFullData?> _getOrLoadLevelFullData(
         await raf.setPosition(entry.valueOffset);
         iccProfile = await raf.read(entry.count);
         await raf.setPosition(currentPos);
+      } else if (entry.tag == 270) {
+        final description = await _readTiffString(raf, entry.count, entry.valueOffset, inlineMaxBytes: entry.inlineMaxBytes, entryBd: entry.entryBd, offsetInEntry: entry.offsetInEntry);
+        if (description != null) {
+          final props = _parseAperioDescription(description);
+          displayColor = parseDisplayColor(props['DisplayColor']);
+        }
       }
     }
 
@@ -714,6 +778,7 @@ Future<_TiledLevelFullData?> _getOrLoadLevelFullData(
       jpegTables: jpegTables,
       iccProfile: iccProfile,
       colorMap: colorMap,
+      displayColor: displayColor ?? globalDisplayColor,
     );
 
     targetLevel.fullData = fullData;
@@ -726,9 +791,23 @@ Future<_TiledLevelFullData?> _getOrLoadLevelFullData(
 /// [svs] is the open [SvsFile].
 /// [layerIndex] is the resolution layer index (0 is the highest resolution / baseline level).
 /// [tileX] and [tileY] are the 0-based horizontal and vertical tile coordinates (not pixel coordinates).
-/// Returns the raw tile bytes, or `null` if the tile coordinates or layer are invalid.
-Future<Uint8List?> extractSvsTile(SvsFile svs, int layerIndex, int tileX, int tileY) async {
+/// [cancelToken] optional cancellation token to abort the operation.
+/// Returns the raw tile bytes, or `null` if the tile coordinates or layer are invalid or cancelled.
+Future<Uint8List?> extractSvsTile(
+  SvsFile svs,
+  int layerIndex,
+  int tileX,
+  int tileY, {
+  CancellationToken? cancelToken,
+}) async {
+  if (cancelToken?.isCancelled == true) {
+    return null;
+  }
+
   final collected = await _getOrCollectTiledLevels(svs);
+  if (cancelToken?.isCancelled == true) {
+    return null;
+  }
   final levels = collected.levels;
 
   if (layerIndex < 0 || layerIndex >= levels.length) {
@@ -736,8 +815,8 @@ Future<Uint8List?> extractSvsTile(SvsFile svs, int layerIndex, int tileX, int ti
   }
 
   final targetLevel = levels[layerIndex];
-  final fullData = await _getOrLoadLevelFullData(svs, targetLevel, collected.globalJpegTables);
-  if (fullData == null) {
+  final fullData = await _getOrLoadLevelFullData(svs, targetLevel, collected.globalJpegTables, collected.globalDisplayColor);
+  if (fullData == null || cancelToken?.isCancelled == true) {
     return null;
   }
 
@@ -757,7 +836,15 @@ Future<Uint8List?> extractSvsTile(SvsFile svs, int layerIndex, int tileX, int ti
     return Uint8List(0);
   }
 
-  return await svs.readBytesAt(offset, byteCount);
+  if (cancelToken?.isCancelled == true) {
+    return null;
+  }
+
+  final bytes = await svs.readBytesAt(offset, byteCount, cancelToken: cancelToken);
+  if (cancelToken?.isCancelled == true) {
+    return null;
+  }
+  return bytes;
 }
 
 /// Extracts a specific tile from a resolution layer in the SVS file and returns it as a decoded [img.Image].
@@ -770,15 +857,28 @@ Future<Uint8List?> extractSvsTile(SvsFile svs, int layerIndex, int tileX, int ti
 /// [applyColorScheme] if `true`, applies the appropriate color scheme interpretation
 /// (e.g., treating RGB JPEG as RGB instead of default YCbCr, WhiteIsZero inversion, palette mapping).
 /// If `false`, extracts the tile image as-is.
-/// Returns the decoded [img.Image], or `null` if the tile coordinates or layer are invalid or failed to decode.
+/// [applyDisplayColor] if `true`, applies the DisplayColor color tinting/mapping if present in metadata or passed explicitly.
+/// [displayColor] optional explicit display color override (e.g., 0xRRGGBB).
+/// [cancelToken] optional cancellation token to abort the operation.
+/// Returns the decoded [img.Image], or `null` if the tile coordinates or layer are invalid, failed to decode, or cancelled.
 Future<img.Image?> extractSvsTileAsImage(
   SvsFile svs,
   int layerIndex,
   int tileX,
   int tileY, {
   bool applyColorScheme = true,
+  bool applyDisplayColor = true,
+  int? displayColor,
+  CancellationToken? cancelToken,
 }) async {
+  if (cancelToken?.isCancelled == true) {
+    return null;
+  }
+
   final collected = await _getOrCollectTiledLevels(svs);
+  if (cancelToken?.isCancelled == true) {
+    return null;
+  }
   final levels = collected.levels;
 
   if (layerIndex < 0 || layerIndex >= levels.length) {
@@ -786,8 +886,8 @@ Future<img.Image?> extractSvsTileAsImage(
   }
 
   final targetLevel = levels[layerIndex];
-  final fullData = await _getOrLoadLevelFullData(svs, targetLevel, collected.globalJpegTables);
-  if (fullData == null) {
+  final fullData = await _getOrLoadLevelFullData(svs, targetLevel, collected.globalJpegTables, collected.globalDisplayColor);
+  if (fullData == null || cancelToken?.isCancelled == true) {
     return null;
   }
 
@@ -803,18 +903,34 @@ Future<img.Image?> extractSvsTileAsImage(
   final offset = fullData.tileOffsets[tileIndex];
   final byteCount = tileIndex < fullData.tileByteCounts.length ? fullData.tileByteCounts[tileIndex] : 0;
 
+  final effectiveDisplayColor = displayColor ?? fullData.displayColor;
+
   // Handle empty / sparse tiles (e.g. background)
   if (byteCount == 0 || offset == 0) {
+    if (cancelToken?.isCancelled == true) {
+      return null;
+    }
     final blank = img.Image(
       width: targetLevel.tileWidth,
       height: targetLevel.tileHeight,
       numChannels: fullData.samplesPerPixel > 0 ? fullData.samplesPerPixel : 3,
     );
     blank.clear(img.ColorRgb8(255, 255, 255));
+    if (applyDisplayColor && effectiveDisplayColor != null && effectiveDisplayColor != 0) {
+      return _applyDisplayColorToImage(blank, effectiveDisplayColor);
+    }
     return blank;
   }
 
-  final rawTileBytes = await svs.readBytesAt(offset, byteCount);
+  if (cancelToken?.isCancelled == true) {
+    return null;
+  }
+
+  final rawTileBytes = await svs.readBytesAt(offset, byteCount, cancelToken: cancelToken);
+
+  if (cancelToken?.isCancelled == true) {
+    return null;
+  }
 
   if (rawTileBytes.isEmpty) {
     final blank = img.Image(
@@ -823,6 +939,9 @@ Future<img.Image?> extractSvsTileAsImage(
       numChannels: fullData.samplesPerPixel > 0 ? fullData.samplesPerPixel : 3,
     );
     blank.clear(img.ColorRgb8(255, 255, 255));
+    if (applyDisplayColor && effectiveDisplayColor != null && effectiveDisplayColor != 0) {
+      return _applyDisplayColorToImage(blank, effectiveDisplayColor);
+    }
     return blank;
   }
 
@@ -835,9 +954,12 @@ Future<img.Image?> extractSvsTileAsImage(
     predictor: fullData.predictor,
     photometricInterpretation: fullData.photometricInterpretation,
     applyColorScheme: applyColorScheme,
+    applyDisplayColor: applyDisplayColor,
+    displayColor: effectiveDisplayColor,
     jpegTables: fullData.jpegTables,
     iccProfile: fullData.iccProfile,
     colorMap: fullData.colorMap,
+    cancelToken: cancelToken,
   );
 }
 
@@ -851,16 +973,23 @@ img.Image? _decodeTileBytes({
   required int predictor,
   required int photometricInterpretation,
   required bool applyColorScheme,
+  bool applyDisplayColor = true,
+  int? displayColor,
   required Uint8List? jpegTables,
   required Uint8List? iccProfile,
   required List<int>? colorMap,
+  CancellationToken? cancelToken,
 }) {
   try {
+    if (cancelToken?.isCancelled == true) return null;
+
     if (compression == 7 || compression == 6) {
       var tileBytes = rawTileBytes;
       if (jpegTables != null) {
         tileBytes = _combineJpegWithTables(rawTileBytes, jpegTables);
       }
+
+      if (cancelToken?.isCancelled == true) return null;
 
       img.Image? tileImg;
 
@@ -874,6 +1003,7 @@ img.Image? _decodeTileBytes({
       }
 
       if (tileImg == null) {
+        if (cancelToken?.isCancelled == true) return null;
         try {
           tileImg = img.decodeJpg(tileBytes);
         } catch (_) {
@@ -882,6 +1012,7 @@ img.Image? _decodeTileBytes({
       }
 
       if (tileImg == null) {
+        if (cancelToken?.isCancelled == true) return null;
         try {
           tileImg = img.decodeImage(tileBytes);
         } catch (_) {
@@ -889,35 +1020,57 @@ img.Image? _decodeTileBytes({
         }
       }
 
-      if (tileImg != null && applyColorScheme) {
-        if (photometricInterpretation == 0) {
-          _applyWhiteIsZero(tileImg);
+      if (tileImg != null) {
+        if (cancelToken?.isCancelled == true) return null;
+        if (applyColorScheme) {
+          if (photometricInterpretation == 0) {
+            _applyWhiteIsZero(tileImg);
+          }
+          if (iccProfile != null && iccProfile.length <= 65519) {
+            if (cancelToken?.isCancelled == true) return null;
+            tileImg.iccProfile = img.IccProfile('', img.IccProfileCompression.none, iccProfile);
+          }
         }
-        if (iccProfile != null && iccProfile.length <= 65519) {
-          tileImg.iccProfile = img.IccProfile('', img.IccProfileCompression.none, iccProfile);
+        if (applyDisplayColor && displayColor != null && displayColor != 0) {
+          if (cancelToken?.isCancelled == true) return null;
+          tileImg = _applyDisplayColorToImage(tileImg, displayColor);
         }
       }
-      return tileImg;
+      return cancelToken?.isCancelled == true ? null : tileImg;
     } else if (compression == 33003 || compression == 33005 || compression == 34712) {
+      if (cancelToken?.isCancelled == true) return null;
       var tileImg = _decodeJpeg2000(rawTileBytes);
-      if (tileImg != null && applyColorScheme) {
-        if (photometricInterpretation == 0) {
-          _applyWhiteIsZero(tileImg);
+      if (cancelToken?.isCancelled == true) return null;
+
+      if (tileImg != null) {
+        if (applyColorScheme) {
+          if (photometricInterpretation == 0) {
+            _applyWhiteIsZero(tileImg);
+          }
+          if (iccProfile != null && iccProfile.length <= 65519) {
+            if (cancelToken?.isCancelled == true) return null;
+            tileImg.iccProfile = img.IccProfile('', img.IccProfileCompression.none, iccProfile);
+          }
         }
-        if (iccProfile != null && iccProfile.length <= 65519) {
-          tileImg.iccProfile = img.IccProfile('', img.IccProfileCompression.none, iccProfile);
+        if (applyDisplayColor && displayColor != null && displayColor != 0) {
+          if (cancelToken?.isCancelled == true) return null;
+          tileImg = _applyDisplayColorToImage(tileImg, displayColor);
         }
       }
-      return tileImg;
+      return cancelToken?.isCancelled == true ? null : tileImg;
     } else if (compression == 5) {
+      if (cancelToken?.isCancelled == true) return null;
+
       final expectedLength = tileWidth * tileHeight * samplesPerPixel;
       final decompressed = _decompressTiffLzw(rawTileBytes, expectedLength);
+      if (cancelToken?.isCancelled == true) return null;
 
       if (predictor == 2) {
         _applyHorizontalPredictor(decompressed, tileWidth, tileHeight, samplesPerPixel);
       }
+      if (cancelToken?.isCancelled == true) return null;
 
-      var tileImg = img.Image.fromBytes(
+      img.Image? tileImg = img.Image.fromBytes(
         width: tileWidth,
         height: tileHeight,
         bytes: decompressed.buffer,
@@ -925,21 +1078,30 @@ img.Image? _decodeTileBytes({
         order: samplesPerPixel >= 3 ? img.ChannelOrder.rgb : null,
       );
       if (applyColorScheme) {
+        if (cancelToken?.isCancelled == true) return null;
         tileImg = _applyColorSchemeToImage(
           tileImg,
           photometricInterpretation,
           samplesPerPixel,
           colorMap,
           iccProfile,
+          displayColor: (applyDisplayColor ? displayColor : null),
+          cancelToken: cancelToken,
         );
+      } else if (applyDisplayColor && displayColor != null && displayColor != 0) {
+        if (cancelToken?.isCancelled == true) return null;
+        tileImg = _applyDisplayColorToImage(tileImg, displayColor);
       }
-      return tileImg;
+      return cancelToken?.isCancelled == true ? null : tileImg;
     } else if (compression == 1) {
+      if (cancelToken?.isCancelled == true) return null;
       final dataBytes = Uint8List.fromList(rawTileBytes);
       if (predictor == 2) {
         _applyHorizontalPredictor(dataBytes, tileWidth, tileHeight, samplesPerPixel);
       }
-      var tileImg = img.Image.fromBytes(
+      if (cancelToken?.isCancelled == true) return null;
+
+      img.Image? tileImg = img.Image.fromBytes(
         width: tileWidth,
         height: tileHeight,
         bytes: dataBytes.buffer,
@@ -947,21 +1109,30 @@ img.Image? _decodeTileBytes({
         order: samplesPerPixel >= 3 ? img.ChannelOrder.rgb : null,
       );
       if (applyColorScheme) {
+        if (cancelToken?.isCancelled == true) return null;
         tileImg = _applyColorSchemeToImage(
           tileImg,
           photometricInterpretation,
           samplesPerPixel,
           colorMap,
           iccProfile,
+          displayColor: (applyDisplayColor ? displayColor : null),
+          cancelToken: cancelToken,
         );
+      } else if (applyDisplayColor && displayColor != null && displayColor != 0) {
+        if (cancelToken?.isCancelled == true) return null;
+        tileImg = _applyDisplayColorToImage(tileImg, displayColor);
       }
-      return tileImg;
+      return cancelToken?.isCancelled == true ? null : tileImg;
     } else if (compression == 8 || compression == 32946) {
+      if (cancelToken?.isCancelled == true) return null;
       final decompressed = Uint8List.fromList(zlib.decode(rawTileBytes));
       if (predictor == 2) {
         _applyHorizontalPredictor(decompressed, tileWidth, tileHeight, samplesPerPixel);
       }
-      var tileImg = img.Image.fromBytes(
+      if (cancelToken?.isCancelled == true) return null;
+
+      img.Image? tileImg = img.Image.fromBytes(
         width: tileWidth,
         height: tileHeight,
         bytes: decompressed.buffer,
@@ -969,28 +1140,47 @@ img.Image? _decodeTileBytes({
         order: samplesPerPixel >= 3 ? img.ChannelOrder.rgb : null,
       );
       if (applyColorScheme) {
+        if (cancelToken?.isCancelled == true) return null;
         tileImg = _applyColorSchemeToImage(
           tileImg,
           photometricInterpretation,
           samplesPerPixel,
           colorMap,
           iccProfile,
+          displayColor: (applyDisplayColor ? displayColor : null),
+          cancelToken: cancelToken,
         );
+      } else if (applyDisplayColor && displayColor != null && displayColor != 0) {
+        if (cancelToken?.isCancelled == true) return null;
+        tileImg = _applyDisplayColorToImage(tileImg, displayColor);
       }
-      return tileImg;
+      return cancelToken?.isCancelled == true ? null : tileImg;
     } else {
+      if (cancelToken?.isCancelled == true) return null;
       var tileImg = img.decodeImage(rawTileBytes);
-      tileImg ??= _decodeJpeg2000(rawTileBytes);
-      if (tileImg != null && applyColorScheme) {
-        tileImg = _applyColorSchemeToImage(
-          tileImg,
-          photometricInterpretation,
-          samplesPerPixel,
-          colorMap,
-          iccProfile,
-        );
+      if (tileImg == null) {
+        if (cancelToken?.isCancelled == true) return null;
+        tileImg = _decodeJpeg2000(rawTileBytes);
       }
-      return tileImg;
+      if (cancelToken?.isCancelled == true) return null;
+      if (tileImg != null) {
+        if (applyColorScheme) {
+          if (cancelToken?.isCancelled == true) return null;
+          tileImg = _applyColorSchemeToImage(
+            tileImg,
+            photometricInterpretation,
+            samplesPerPixel,
+            colorMap,
+            iccProfile,
+            displayColor: (applyDisplayColor ? displayColor : null),
+            cancelToken: cancelToken,
+          );
+        } else if (applyDisplayColor && displayColor != null && displayColor != 0) {
+          if (cancelToken?.isCancelled == true) return null;
+          tileImg = _applyDisplayColorToImage(tileImg, displayColor);
+        }
+      }
+      return cancelToken?.isCancelled == true ? null : tileImg;
     }
   } catch (e) {
     return null;
@@ -1305,6 +1495,7 @@ Future<SvsFullMetadata?> readFullSvsMetadata(SvsFile svs) async {
         tileHeight: tileHeight,
         compression: properties['Compression'],
         properties: properties,
+        displayColor: parseDisplayColor(properties['DisplayColor']),
       ));
 
       // Process SubIFDs if present
@@ -1365,6 +1556,7 @@ Future<SvsFullMetadata?> readFullSvsMetadata(SvsFile svs) async {
               tileHeight: sTileHeight,
               compression: sProperties['Compression'] ?? properties['Compression'],
               properties: sProperties.isNotEmpty ? sProperties : properties,
+              displayColor: parseDisplayColor(sProperties['DisplayColor'] ?? properties['DisplayColor']),
             ));
           }
         }
@@ -1392,7 +1584,15 @@ Future<SvsFullMetadata?> readFullSvsMetadata(SvsFile svs) async {
 
     levels.sort((a, b) => b.width.compareTo(a.width));
 
-    return SvsFullMetadata(levels: levels, associations: associations);
+    final double baseWidth = levels.isNotEmpty ? levels.first.width.toDouble() : 1.0;
+    final List<SvsImageInfo> levelsWithDownsample = levels.map((lvl) {
+      final double downsample = (baseWidth > 0 && lvl.width > 0)
+          ? (baseWidth / lvl.width)
+          : 1.0;
+      return lvl.copyWith(downsample: downsample);
+    }).toList();
+
+    return SvsFullMetadata(levels: levelsWithDownsample, associations: associations);
   });
 }
 
@@ -1445,6 +1645,7 @@ Future<SvsMetadata?> readSvsMetadata(SvsFile svs) async {
       tileWidth: tileWidth,
       tileHeight: tileHeight,
       compression: properties['Compression'],
+      displayColor: parseDisplayColor(properties['DisplayColor']),
     );
   });
 }
@@ -1744,13 +1945,74 @@ Uint8List _injectAdobeMarker(Uint8List jpegBytes, int transformCode) {
   return bb.takeBytes();
 }
 
-img.Image _applyColorSchemeToImage(
+/// Parses an integer display color from a dynamic value, string (decimal, hex with # or 0x), or int.
+int? parseDisplayColor(dynamic value) {
+  if (value == null) return null;
+  if (value is int) return value;
+  final str = value.toString().trim();
+  if (str.isEmpty) return null;
+  if (str.startsWith('#')) {
+    return int.tryParse(str.substring(1), radix: 16);
+  }
+  if (str.startsWith('0x') || str.startsWith('0X')) {
+    return int.tryParse(str.substring(2), radix: 16);
+  }
+  return int.tryParse(str);
+}
+
+/// Applies the DisplayColor color tinting/mapping to the image.
+///
+/// [displayColor] is interpreted as a 24-bit/32-bit RGB integer (0xRRGGBB).
+img.Image _applyDisplayColorToImage(img.Image image, int displayColor) {
+  final targetR = (displayColor >> 16) & 0xFF;
+  final targetG = (displayColor >> 8) & 0xFF;
+  final targetB = displayColor & 0xFF;
+
+  if (targetR == 255 && targetG == 255 && targetB == 255) {
+    return image;
+  }
+
+  if (image.numChannels < 3) {
+    final rgbImage = img.Image(
+      width: image.width,
+      height: image.height,
+      numChannels: 3,
+    );
+    for (int y = 0; y < image.height; y++) {
+      for (int x = 0; x < image.width; x++) {
+        final pixel = image.getPixel(x, y);
+        final v = pixel.r.toInt();
+        final r = (v * targetR) ~/ 255;
+        final g = (v * targetG) ~/ 255;
+        final b = (v * targetB) ~/ 255;
+        rgbImage.setPixelRgb(x, y, r, g, b);
+      }
+    }
+    if (image.iccProfile != null) {
+      rgbImage.iccProfile = image.iccProfile;
+    }
+    return rgbImage;
+  }
+
+  for (final pixel in image) {
+    pixel.r = (pixel.r * targetR) ~/ 255;
+    pixel.g = (pixel.g * targetG) ~/ 255;
+    pixel.b = (pixel.b * targetB) ~/ 255;
+  }
+
+  return image;
+}
+
+img.Image? _applyColorSchemeToImage(
   img.Image image,
   int photometricInterpretation,
   int samplesPerPixel,
   List<int>? colorMap,
-  Uint8List? iccProfile,
-) {
+  Uint8List? iccProfile, {
+  int? displayColor,
+  CancellationToken? cancelToken,
+}) {
+  if (cancelToken?.isCancelled == true) return null;
   img.Image result = image;
 
   if (photometricInterpretation == 0) {
@@ -1763,6 +2025,7 @@ img.Image _applyColorSchemeToImage(
       }
     }
   } else if (photometricInterpretation == 3 && colorMap != null && samplesPerPixel == 1) {
+    if (cancelToken?.isCancelled == true) return null;
     // Palette: Map 1-channel indexed colors to RGB
     final numColors = colorMap.length ~/ 3;
     final rOffset = 0;
@@ -1794,8 +2057,16 @@ img.Image _applyColorSchemeToImage(
     result = rgbImage;
   }
 
+  if (cancelToken?.isCancelled == true) return null;
+
   if (iccProfile != null && iccProfile.length <= 65519) {
     result.iccProfile = img.IccProfile('', img.IccProfileCompression.none, iccProfile);
+  }
+
+  if (cancelToken?.isCancelled == true) return null;
+
+  if (displayColor != null && displayColor != 0) {
+    result = _applyDisplayColorToImage(result, displayColor);
   }
 
   return result;

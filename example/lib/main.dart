@@ -119,7 +119,7 @@ class _TestScreenState extends State<TestScreen> {
           for (var i = 0; i < fullMeta.levels.length; i++) {
             var level = fullMeta.levels[i];
             _log(
-                "  Level $i: ${level.width}x${level.height}, Tile: ${level.tileWidth}x${level.tileHeight}, Comp: ${level.compression}");
+                "  Level $i: ${level.width}x${level.height}, Tile: ${level.tileWidth}x${level.tileHeight}, Downsample: ${level.downsample}, Comp: ${level.compression}");
           }
           _log("Associations: ${fullMeta.associations.keys.toList()}");
           fullMeta.associations.forEach((key, value) {
